@@ -28,6 +28,10 @@ from pypdf import PdfReader
 WIKIMEDIA_API = "https://commons.wikimedia.org/w/api.php"
 USER_AGENT = os.environ.get("H5P_IMG_USER_AGENT", "H5PActivityGenerator/1.0 (contact: content@imperiallearning.co.uk)")
 LLM_API_KEY = os.getenv("LLM_API_KEY", "").strip()
+LLM_API_BASE = os.getenv("LLM_API_BASE", "https://openrouter.ai/api/v1").strip().rstrip("/")
+LLM_MODEL = os.getenv("LLM_MODEL", "openai/gpt-4.1-mini").strip()
+LLM_HTTP_REFERER = os.getenv("LLM_HTTP_REFERER", "").strip()
+LLM_APP_TITLE = os.getenv("LLM_APP_TITLE", "H5P Activity Generator").strip()
 FREEPIK_API_KEY = os.getenv("FREEPIK_API_KEY", "").strip()
 
 # Some existing helper functions read LLM_API_KEY directly from os.environ.
@@ -3446,18 +3450,79 @@ def _parse_openai_error(resp: requests.Response) -> Tuple[str, str]:
     except Exception:
         return "error", resp.text
 
-def call_openai_chat_json(system: str, user: str, model: str = "gpt-4.1-mini", temperature: float = 0.2) -> Dict[str, Any]:
-    api_key = os.environ.get("LLM_API_KEY")
+def _parse_llm_json_content(content: Any) -> Dict[str, Any]:
+    """Parse a JSON object returned by an OpenAI-compatible chat API.
+
+    OpenRouter models occasionally wrap JSON in Markdown fences even when the
+    prompt says "JSON only". This keeps the generator tolerant of that output
+    without changing the activity-generation prompts.
+    """
+    if isinstance(content, dict):
+        return content
+    if not isinstance(content, str):
+        raise RuntimeError("LLM response did not contain text JSON.")
+
+    text = content.strip()
+    if text.startswith("```"):
+        text = re.sub(r"^```(?:json)?\s*", "", text, flags=re.IGNORECASE)
+        text = re.sub(r"\s*```$", "", text).strip()
+
+    try:
+        obj = json.loads(text)
+    except json.JSONDecodeError:
+        start = text.find("{")
+        end = text.rfind("}")
+        if start == -1 or end <= start:
+            raise RuntimeError("LLM returned invalid JSON.")
+        try:
+            obj = json.loads(text[start:end + 1])
+        except json.JSONDecodeError as exc:
+            raise RuntimeError("LLM returned invalid JSON.") from exc
+
+    if not isinstance(obj, dict):
+        raise RuntimeError("LLM JSON response must be an object.")
+    return obj
+
+
+def call_openai_chat_json(
+    system: str,
+    user: str,
+    model: Optional[str] = None,
+    temperature: float = 0.2,
+) -> Dict[str, Any]:
+    """Call an OpenAI-compatible chat-completions API.
+
+    Defaults are configured for OpenRouter, while LLM_API_BASE and LLM_MODEL
+    can be changed in Railway without editing this file again.
+    """
+    api_key = (os.environ.get("LLM_API_KEY") or LLM_API_KEY).strip()
     if not api_key:
         raise RuntimeError("Missing API key. Set environment variable LLM_API_KEY.")
 
-    url = "https://api.openai.com/v1/chat/completions"
-    headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
+    api_base = (os.environ.get("LLM_API_BASE") or LLM_API_BASE or "https://openrouter.ai/api/v1").strip().rstrip("/")
+    resolved_model = (model or os.environ.get("LLM_MODEL") or LLM_MODEL or "openai/gpt-4.1-mini").strip()
+    url = f"{api_base}/chat/completions"
+
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+    }
+
+    referer = (os.environ.get("LLM_HTTP_REFERER") or LLM_HTTP_REFERER).strip()
+    app_title = (os.environ.get("LLM_APP_TITLE") or LLM_APP_TITLE).strip()
+    if referer:
+        headers["HTTP-Referer"] = referer
+    if app_title:
+        headers["X-Title"] = app_title
+
     payload = {
-        "model": model,
-        "messages": [{"role": "system", "content": system}, {"role": "user", "content": user}],
+        "model": resolved_model,
+        "messages": [
+            {"role": "system", "content": system},
+            {"role": "user", "content": user},
+        ],
         "temperature": float(temperature),
-        "response_format": {"type": "json_object"},
     }
 
     max_attempts = 7
@@ -3465,10 +3530,19 @@ def call_openai_chat_json(system: str, user: str, model: str = "gpt-4.1-mini", t
         try:
             resp = requests.post(url, headers=headers, json=payload, timeout=240)
 
+            if resp.status_code in (401, 403):
+                _, msg = _parse_openai_error(resp)
+                raise RuntimeError(
+                    f"LLM authentication failed ({resp.status_code}). "
+                    f"Check LLM_API_KEY and LLM_API_BASE. {msg[:300]}"
+                )
+
             if resp.status_code == 429:
                 code, msg = _parse_openai_error(resp)
-                if "insufficient_quota" in code or "quota" in msg.lower():
-                    raise RuntimeError("OpenAI API quota/credits exhausted for this key. Add credits or use a different key.")
+                if "insufficient_quota" in code.lower() or "quota" in msg.lower() or "credits" in msg.lower():
+                    raise RuntimeError(
+                        "LLM API credits/quota are exhausted for this key. Add credits or use a different key."
+                    )
                 retry_after = resp.headers.get("Retry-After")
                 if retry_after:
                     try:
@@ -3478,27 +3552,39 @@ def call_openai_chat_json(system: str, user: str, model: str = "gpt-4.1-mini", t
                 else:
                     sleep_s = min(40.0, (2 ** (attempt - 1))) + random.uniform(0, 0.8)
                 if attempt == max_attempts:
-                    raise RuntimeError("OpenAI API rate limit reached. Try again shortly, or reduce concurrency/requests.")
+                    raise RuntimeError("LLM API rate limit reached. Try again shortly.")
                 time.sleep(sleep_s)
                 continue
 
             if resp.status_code in (500, 502, 503, 504):
                 sleep_s = min(30.0, (2 ** (attempt - 1))) + random.uniform(0, 0.8)
                 if attempt == max_attempts:
-                    code, msg = _parse_openai_error(resp)
-                    raise RuntimeError(f"Temporary server error ({resp.status_code}). {msg[:200]}")
+                    _, msg = _parse_openai_error(resp)
+                    raise RuntimeError(f"Temporary LLM server error ({resp.status_code}). {msg[:300]}")
                 time.sleep(sleep_s)
                 continue
 
-            resp.raise_for_status()
-            content = resp.json()["choices"][0]["message"]["content"]
-            return json.loads(content)
+            if resp.status_code >= 400:
+                _, msg = _parse_openai_error(resp)
+                raise RuntimeError(f"LLM API request failed ({resp.status_code}). {msg[:500]}")
 
-        except requests.exceptions.RequestException as e:
+            data = resp.json()
+            choices = data.get("choices") or []
+            if not choices:
+                raise RuntimeError("LLM API returned no choices.")
+            message = choices[0].get("message") or {}
+            content = message.get("content")
+            return _parse_llm_json_content(content)
+
+        except RuntimeError:
+            raise
+        except requests.exceptions.RequestException as exc:
             if attempt == max_attempts:
-                raise RuntimeError(f"API request failed after retries. {str(e)}") from e
+                raise RuntimeError(f"LLM API request failed after retries. {exc}") from exc
             sleep_s = min(30.0, (2 ** (attempt - 1))) + random.uniform(0, 0.8)
             time.sleep(sleep_s)
+        except (ValueError, KeyError, TypeError) as exc:
+            raise RuntimeError(f"Unexpected LLM response format: {exc}") from exc
 
     raise RuntimeError("Unexpected: request loop ended without returning.")
 
