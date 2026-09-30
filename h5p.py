@@ -28,19 +28,30 @@ from pypdf import PdfReader
 # ----------------------------
 WIKIMEDIA_API = "https://commons.wikimedia.org/w/api.php"
 USER_AGENT = os.environ.get("H5P_IMG_USER_AGENT", "H5PActivityGenerator/1.0 (contact: content@imperiallearning.co.uk)")
-LLM_API_KEY = os.getenv("LLM_API_KEY")
-FREEPIK_API_KEY = os.getenv("FREEPIK_API_KEY")
+def _safe_streamlit_secret(name: str, default: str = "") -> str:
+    """Read a Streamlit secret without crashing when secrets.toml is absent.
 
-# Pull keys from Streamlit secrets (Cloud + local secrets.toml)
-if "LLM_API_KEY" in st.secrets and not os.environ.get("LLM_API_KEY"):
-    os.environ["LLM_API_KEY"] = st.secrets["LLM_API_KEY"]
+    Railway/Vercel deployments normally use environment variables, while local
+    Streamlit development may use .streamlit/secrets.toml.
+    """
+    try:
+        value = st.secrets.get(name, default)
+        return str(value).strip() if value is not None else default
+    except Exception:
+        return default
 
-if "FREEPIK_API_KEY" in st.secrets and not os.environ.get("FREEPIK_API_KEY"):
-    os.environ["FREEPIK_API_KEY"] = st.secrets["FREEPIK_API_KEY"]
 
-# Re-read keys after Streamlit secrets injection (globals above were read before os.environ was updated)
-LLM_API_KEY = os.getenv("LLM_API_KEY") or LLM_API_KEY
-FREEPIK_API_KEY = os.getenv("FREEPIK_API_KEY") or FREEPIK_API_KEY
+# Prefer deployment environment variables. Fall back to Streamlit secrets only
+# when they are actually available.
+LLM_API_KEY = (os.getenv("LLM_API_KEY") or _safe_streamlit_secret("LLM_API_KEY")).strip()
+FREEPIK_API_KEY = (os.getenv("FREEPIK_API_KEY") or _safe_streamlit_secret("FREEPIK_API_KEY")).strip()
+
+# Some existing helper functions read LLM_API_KEY directly from os.environ.
+# Mirror the resolved value there so both old and new code paths work.
+if LLM_API_KEY:
+    os.environ["LLM_API_KEY"] = LLM_API_KEY
+if FREEPIK_API_KEY:
+    os.environ["FREEPIK_API_KEY"] = FREEPIK_API_KEY
 
 # Freepik API configuration
 FREEPIK_API_BASE = os.getenv("FREEPIK_API_BASE", "https://api.freepik.com/v1").rstrip("/")
@@ -798,12 +809,12 @@ H5P_IMPORT_ENDPOINT = os.getenv("H5P_IMPORT_ENDPOINT", "").strip()
 H5P_IMPORT_TOKEN = os.getenv("H5P_IMPORT_TOKEN", "").strip()
 H5P_EDITOR_URL = os.getenv("H5P_EDITOR_URL", "").strip()
 
-if "H5P_IMPORT_ENDPOINT" in st.secrets and not H5P_IMPORT_ENDPOINT:
-    H5P_IMPORT_ENDPOINT = str(st.secrets["H5P_IMPORT_ENDPOINT"]).strip()
-if "H5P_IMPORT_TOKEN" in st.secrets and not H5P_IMPORT_TOKEN:
-    H5P_IMPORT_TOKEN = str(st.secrets["H5P_IMPORT_TOKEN"]).strip()
-if "H5P_EDITOR_URL" in st.secrets and not H5P_EDITOR_URL:
-    H5P_EDITOR_URL = str(st.secrets["H5P_EDITOR_URL"]).strip()
+if not H5P_IMPORT_ENDPOINT:
+    H5P_IMPORT_ENDPOINT = _safe_streamlit_secret("H5P_IMPORT_ENDPOINT")
+if not H5P_IMPORT_TOKEN:
+    H5P_IMPORT_TOKEN = _safe_streamlit_secret("H5P_IMPORT_TOKEN")
+if not H5P_EDITOR_URL:
+    H5P_EDITOR_URL = _safe_streamlit_secret("H5P_EDITOR_URL")
 
 
 def send_h5p_to_editor(h5p_bytes: bytes, filename: str, endpoint: str, token: str = "") -> str:

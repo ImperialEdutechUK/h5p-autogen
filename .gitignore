@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+.env
+.env.*
+!.env.example
+!.env.railway.example
+.streamlit/secrets.toml
+vercel-frontend/node_modules/
+vercel-frontend/.next/
+.DS_Store
