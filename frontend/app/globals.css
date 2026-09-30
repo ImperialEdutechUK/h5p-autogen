@@ -1,0 +1,31 @@
+* { box-sizing: border-box; }
+html, body { margin: 0; padding: 0; }
+body { font-family: Arial, Helvetica, sans-serif; background: #f4f7fb; color: #0d1b2f; }
+button, input, select { font: inherit; }
+.page-shell { width: min(1320px, calc(100% - 32px)); margin: 0 auto; padding: 36px 0 64px; }
+.hero { padding: 18px 6px 24px; }
+.eyebrow { margin: 0 0 8px; color: #4d63d8; font-weight: 700; text-transform: uppercase; letter-spacing: .08em; font-size: 12px; }
+h1 { margin: 0; font-size: clamp(32px, 4vw, 48px); }
+.subtitle { margin: 12px 0 0; color: #5d6b82; max-width: 760px; }
+.card { background: #fff; border: 1px solid #dde4ef; border-radius: 20px; padding: 28px; margin-top: 22px; box-shadow: 0 10px 30px rgba(16, 31, 58, .05); }
+.card h2 { margin: 0 0 22px; font-size: 24px; }
+.card h3 { margin: 4px 0 22px; }
+.grid { display: grid; gap: 20px; }
+.grid.two { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+label { display: block; }
+label > span { display: block; font-weight: 700; margin-bottom: 8px; }
+input, select { width: 100%; border: 1px solid #cdd6e5; border-radius: 14px; padding: 15px 16px; background: #fff; }
+input:focus, select:focus { outline: 3px solid rgba(67, 89, 255, .12); border-color: #5c6cff; }
+.upload-box { border: 1px dashed #cbd5e7; border-radius: 16px; padding: 18px; margin-bottom: 16px; background: #fbfcff; }
+.upload-box input { padding: 8px 0; border: 0; }
+.upload-box small { display: block; margin-top: 6px; color: #69758a; }
+button, .button-link { border: 0; border-radius: 13px; padding: 14px 20px; font-weight: 700; cursor: pointer; text-decoration: none; display: inline-flex; align-items: center; justify-content: center; }
+.primary { background: #4057f5; color: white; }
+.secondary { background: #eef2ff; color: #263d9f; border: 1px solid #d6defa; }
+button:disabled { opacity: .55; cursor: not-allowed; }
+.card > button { margin-top: 20px; }
+.alert { border-radius: 14px; padding: 16px 18px; margin-top: 20px; font-weight: 700; }
+.alert.error { background: #fff0ee; border: 1px solid #ffb9b0; color: #bd2818; }
+.alert.success { background: #edf9f1; border: 1px solid #bfe8ca; color: #166534; }
+.actions { display: flex; flex-wrap: wrap; gap: 12px; }
+@media (max-width: 760px) { .grid.two { grid-template-columns: 1fr; } .page-shell { width: min(100% - 20px, 1320px); } .card { padding: 20px; } }
