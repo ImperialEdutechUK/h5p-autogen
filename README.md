@@ -1,56 +1,77 @@
-🌐 Live Demo :
-https://h5p-autogen.streamlit.app/
+# H5P Activity Generator — FastAPI + Next.js
 
-## Open generated activity directly in H5P
+This version contains **no Streamlit**.
 
-The app can now send the generated `.h5p` package to an H5P host and open the returned editor URL.
+## Architecture
 
-Configure these environment variables or Streamlit secrets:
+- **Railway:** FastAPI backend, PDF extraction, OpenAI calls, H5P package generation, H5P import bridge.
+- **Vercel:** Next.js frontend.
+- The frontend talks directly to the Railway API over HTTPS. There is no iframe and no Streamlit session/XSRF upload flow.
 
-- `H5P_IMPORT_ENDPOINT` - an endpoint on your H5P host that accepts a multipart POST with a file field named `file`.
-- `H5P_IMPORT_TOKEN` - optional Bearer token for the import endpoint.
-- `H5P_EDITOR_URL` - optional fallback editor URL.
+## Railway deployment
 
-The import endpoint should return JSON in one of these forms:
+Deploy the repository root to Railway. Railway uses the root `Dockerfile`.
 
-```json
-{"edit_url": "https://your-h5p-site.example/editor/123"}
+Required variable:
+
+```text
+LLM_API_KEY=...
 ```
 
-or use `editor_url` / `url` instead of `edit_url`.
+Recommended after the Vercel domain is known:
 
-Flow:
-
-1. Generate an activity in the web tool.
-2. Click **Send to H5P**.
-3. The web tool uploads the generated `.h5p` package to the configured endpoint.
-4. Click **Open H5P Editor**.
-5. The H5P editor opens with that generated activity already imported and ready to edit.
-
-A real H5P host must provide the import endpoint. H5P itself does not expose one universal cross-platform import URL, so the exact receiver depends on whether the target is Moodle, WordPress, H5P.com, or another H5P integration.
-
-## H5P editor integration
-
-After generating an activity, the app now shows **Send to H5P** and **Open H5P Editor**.
-
-Configure these values as environment variables or Streamlit secrets:
-
-- `H5P_IMPORT_ENDPOINT` - receiver URL on your H5P/Moodle/WordPress server.
-- `H5P_IMPORT_TOKEN` - optional Bearer token used by that receiver.
-- `H5P_EDITOR_URL` - optional fallback editor URL.
-
-The receiver must accept a multipart POST containing a field named `file` with the generated `.h5p` package. It must import/create the activity and return JSON containing its edit URL, for example:
-
-```json
-{
-  "edit_url": "https://example.org/h5p/edit/123"
-}
+```text
+FRONTEND_ORIGINS=https://your-project.vercel.app
 ```
 
-`editor_url` or `url` are also accepted.
+During the first test you may temporarily use:
 
-This gives the following flow:
+```text
+FRONTEND_ORIGINS=*
+```
 
-Web Tool -> AI generation -> H5P package -> Send to H5P -> Import -> Open H5P editor -> Review/Edit -> Save
+Optional H5P editor bridge:
 
-The exact receiver implementation depends on the H5P host. Moodle, WordPress and H5P.com do not share one universal import API.
+```text
+H5P_IMPORT_ENDPOINT=https://your-h5p-receiver.example/api/import
+H5P_IMPORT_TOKEN=...
+H5P_EDITOR_URL=...
+```
+
+After deployment, generate a Railway public domain and verify:
+
+```text
+https://your-api.up.railway.app/health
+```
+
+## Vercel deployment
+
+Import the same repository into Vercel and set the **Root Directory** to:
+
+```text
+frontend
+```
+
+Add:
+
+```text
+NEXT_PUBLIC_API_URL=https://your-api.up.railway.app
+```
+
+Then redeploy.
+
+## Main API routes
+
+- `GET /health`
+- `GET /api/activity-types`
+- `POST /api/suggest`
+- `POST /api/generate`
+- `GET /api/jobs/{job_id}/h5p`
+- `GET /api/jobs/{job_id}/qa`
+- `POST /api/jobs/{job_id}/send-to-h5p`
+
+Generated files are held temporarily on the Railway instance and expire automatically.
+
+## Current H5P generation
+
+The backend preserves the existing generator logic and templates for the recommended activities, including Quiz, Multiple Choice, Dialog Cards, Dictation, Page, Course Presentation, Interactive Book, Drag the Words, Fill in the Blanks, Mark the Words, Cornell Notes, Essay and Summary. Other installed templates use the existing generic JSON patch generator.

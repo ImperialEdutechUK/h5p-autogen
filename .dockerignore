@@ -1,13 +1,8 @@
 .git
 .gitignore
+frontend
 __pycache__
 *.pyc
-*.pyo
-*.pyd
 .env
 .env.*
-.streamlit/secrets.toml
-node_modules
-.next
-vercel-frontend/node_modules
-vercel-frontend/.next
+README.md

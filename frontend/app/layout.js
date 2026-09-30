@@ -2,7 +2,7 @@ import "./globals.css";
 
 export const metadata = {
   title: "H5P Activity Generator",
-  description: "AI-assisted H5P activity generation"
+  description: "AI-assisted H5P activity generation",
 };
 
 export default function RootLayout({ children }) {
