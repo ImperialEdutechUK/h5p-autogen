@@ -1,8 +1,0 @@
-.git
-.gitignore
-frontend
-__pycache__
-*.pyc
-.env
-.env.*
-README.md

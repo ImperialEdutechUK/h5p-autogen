@@ -1,0 +1,18 @@
+# Existing backend variables
+LLM_API_KEY=your_openrouter_key
+LLM_API_BASE=https://openrouter.ai/api/v1
+LLM_MODEL=openai/gpt-4.1-mini
+FRONTEND_ORIGINS=*
+USE_AI_IMAGES=0
+
+# H5P.com automation
+H5P_CREATE_URL=https://imperiallearning.h5p.com/content/create
+H5P_TEST_TARGET_URL=https://imperiallearning.h5p.com/content/1292811530103001337
+H5P_BROWSER_HEADLESS=1
+
+# Use normal H5P.com credentials when the account has no SSO/MFA.
+H5P_USERNAME=your_h5p_login
+H5P_PASSWORD=your_h5p_password
+
+# For SSO/MFA, leave H5P_USERNAME/H5P_PASSWORD blank and use a Playwright storage-state JSON instead.
+# H5P_STORAGE_STATE_JSON={"cookies":[...],"origins":[...]}

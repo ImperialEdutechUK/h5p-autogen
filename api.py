@@ -13,6 +13,7 @@ from fastapi.responses import FileResponse
 from pydantic import BaseModel
 
 import generator_core as core
+from h5p_browser_automation import automate_h5p_com_import, check_h5p_com_connection
 
 BASE_DIR = Path(__file__).resolve().parent
 TEMPLATES_DIR = BASE_DIR / "templates"
@@ -435,5 +436,35 @@ def send_to_h5p(job_id: str, body: H5PSendRequest):
     try:
         edit_url = core.send_h5p_to_editor(files[0].read_bytes(), files[0].name, endpoint, token)
         return {"edit_url": edit_url}
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+class H5PBrowserRequest(BaseModel):
+    auto_save: bool = True
+    inspect_test_target: bool = True
+
+
+@app.get("/api/h5p/automation-check")
+async def h5p_automation_check():
+    """Check H5P.com authentication and inspect the configured testing URL."""
+    try:
+        return await check_h5p_com_connection()
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+
+@app.post("/api/jobs/{job_id}/publish-to-h5p")
+async def publish_to_h5p(job_id: str, body: H5PBrowserRequest):
+    """Upload the generated .h5p to Imperial Learning H5P.com and save it."""
+    job_dir = ARTIFACT_DIR / job_id
+    files = list(job_dir.glob("*.h5p")) if job_dir.exists() else []
+    if not files:
+        raise HTTPException(status_code=404, detail="Generated H5P file not found or expired.")
+    try:
+        return await automate_h5p_com_import(
+            str(files[0]),
+            auto_save=body.auto_save,
+            inspect_test_target=body.inspect_test_target,
+        )
     except Exception as exc:
         raise HTTPException(status_code=400, detail=str(exc))
