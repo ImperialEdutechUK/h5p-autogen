@@ -421,18 +421,40 @@ def download_qa(job_id: str):
 class H5PSendRequest(BaseModel):
     endpoint: Optional[str] = None
     token: Optional[str] = None
+    auto_save: bool = True
+    inspect_test_target: bool = True
 
 
 @app.post("/api/jobs/{job_id}/send-to-h5p")
-def send_to_h5p(job_id: str, body: H5PSendRequest):
+async def send_to_h5p(job_id: str, body: H5PSendRequest):
+    """Send a generated .h5p to an editor.
+
+    If a generic import endpoint is configured (via the request body or
+    H5P_IMPORT_ENDPOINT), POST the package there directly. Otherwise fall
+    back to the Playwright-based H5P.com automation (the same flow used by
+    /publish-to-h5p), so this route still works out of the box using the
+    H5P_CREATE_URL / H5P_USERNAME / H5P_PASSWORD variables documented in
+    .env.railway.example instead of requiring a separate, undocumented
+    H5P_IMPORT_ENDPOINT variable.
+    """
     job_dir = ARTIFACT_DIR / job_id
     files = list(job_dir.glob("*.h5p")) if job_dir.exists() else []
     if not files:
         raise HTTPException(status_code=404, detail="Generated H5P file not found or expired.")
+
     endpoint = (body.endpoint or os.getenv("H5P_IMPORT_ENDPOINT", "")).strip()
     token = (body.token or os.getenv("H5P_IMPORT_TOKEN", "")).strip()
+
     if not endpoint:
-        raise HTTPException(status_code=400, detail="H5P_IMPORT_ENDPOINT is not configured.")
+        try:
+            return await automate_h5p_com_import(
+                str(files[0]),
+                auto_save=body.auto_save,
+                inspect_test_target=body.inspect_test_target,
+            )
+        except Exception as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+
     try:
         edit_url = core.send_h5p_to_editor(files[0].read_bytes(), files[0].name, endpoint, token)
         return {"edit_url": edit_url}
