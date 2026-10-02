@@ -4,6 +4,22 @@ import { useEffect, useMemo, useState } from "react";
 
 const API_URL = (process.env.NEXT_PUBLIC_API_URL || "").replace(/\/$/, "");
 
+// FastAPI's error "detail" is usually a string, but on validation errors
+// (422) it can be a list of {msg, loc} objects, or occasionally a nested
+// object. Coerce any of those into a plain readable string so the UI never
+// renders a bare "[object Object]".
+function toErrorMessage(detail) {
+  if (!detail) return "";
+  if (typeof detail === "string") return detail;
+  if (Array.isArray(detail)) {
+    return detail
+      .map((d) => (typeof d === "string" ? d : d?.msg || JSON.stringify(d)))
+      .join("; ");
+  }
+  if (typeof detail === "object") return detail.msg || JSON.stringify(detail);
+  return String(detail);
+}
+
 export default function Home() {
   const [activityTypes, setActivityTypes] = useState([]);
   const [courseName, setCourseName] = useState("");
@@ -58,7 +74,7 @@ export default function Home() {
 
       const r = await fetch(`${API_URL}/api/suggest`, { method: "POST", body: fd });
       const data = await r.json().catch(() => ({}));
-      if (!r.ok) throw new Error(data.detail || "Failed to suggest H5P types.");
+      if (!r.ok) throw new Error(toErrorMessage(data.detail) || "Failed to suggest H5P types.");
 
       const recs = data.recommendations || [];
       if (recs.length) {
@@ -96,7 +112,7 @@ export default function Home() {
 
       const r = await fetch(`${API_URL}/api/generate`, { method: "POST", body: fd });
       const data = await r.json().catch(() => ({}));
-      if (!r.ok) throw new Error(data.detail || "H5P generation failed.");
+      if (!r.ok) throw new Error(toErrorMessage(data.detail) || "H5P generation failed.");
 
       setResult(data);
       setMessage("Activity generated successfully.");
@@ -116,9 +132,11 @@ export default function Home() {
     try {
       const r = await fetch(`${API_URL}/api/jobs/${result.job_id}/publish-to-h5p`, {
         method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ auto_save: true, inspect_test_target: true }),
       });
       const data = await r.json().catch(() => ({}));
-      if (!r.ok) throw new Error(data.detail || "Failed to publish to H5P.");
+      if (!r.ok) throw new Error(toErrorMessage(data.detail) || "Failed to publish to H5P.");
 
       const finalUrl = data.url || data.edit_url || data.content_url;
       setMessage("Published to H5P successfully.");
