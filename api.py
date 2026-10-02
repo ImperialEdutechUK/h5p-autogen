@@ -426,7 +426,7 @@ class H5PSendRequest(BaseModel):
 
 
 @app.post("/api/jobs/{job_id}/send-to-h5p")
-async def send_to_h5p(job_id: str, body: H5PSendRequest):
+async def send_to_h5p(job_id: str, body: H5PSendRequest = H5PSendRequest()):
     """Send a generated .h5p to an editor.
 
     If a generic import endpoint is configured (via the request body or
@@ -476,7 +476,7 @@ async def h5p_automation_check():
 
 
 @app.post("/api/jobs/{job_id}/publish-to-h5p")
-async def publish_to_h5p(job_id: str, body: H5PBrowserRequest):
+async def publish_to_h5p(job_id: str, body: H5PBrowserRequest = H5PBrowserRequest()):
     """Upload the generated .h5p to Imperial Learning H5P.com and save it."""
     job_dir = ARTIFACT_DIR / job_id
     files = list(job_dir.glob("*.h5p")) if job_dir.exists() else []
