@@ -154,7 +154,7 @@ export default function Home() {
       const r = await fetch(`${API_URL}/api/jobs/${result.job_id}/publish-to-h5p`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ auto_save: true, inspect_test_target: true }),
+        body: JSON.stringify({ auto_save: true, inspect_test_target: false }),
       });
       const data = await r.json().catch(() => ({}));
       if (!r.ok) throw new Error(toErrorMessage(data.detail) || "Failed to publish to H5P.");

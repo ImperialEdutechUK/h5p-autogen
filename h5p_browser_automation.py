@@ -215,41 +215,199 @@ async def _select_upload_mode(page) -> None:
     raise H5PAutomationError("Could not switch H5P.com to Upload mode.")
 
 
-async def _find_upload_input(page, timeout_ms: int = 30000):
-    """Find the .h5p file input in the page OR an embedded H5P Hub frame.
-
-    The input is commonly hidden, so this function deliberately looks for
-    attached elements rather than requiring visibility.
-    """
+async def _find_upload_input(page, timeout_ms: int = 12000):
+    """Find any attached file input used by the H5P Hub upload control."""
     selectors = [
         'input[type="file"][accept*=".h5p" i]',
         'input[type="file"][accept*="h5p" i]',
         'input[type="file"][name*="h5p" i]',
         'input[type="file"][id*="h5p" i]',
-        'input[type="file"][class*="h5p" i]',
         'input[type="file"]',
     ]
 
-    steps = max(1, timeout_ms // 400)
+    steps = max(1, timeout_ms // 300)
     for _ in range(steps):
-        # Frames can appear after the H5P Hub loads, so rebuild scopes each loop.
         for scope in _scopes(page):
             for selector in selectors:
                 try:
                     loc = scope.locator(selector)
-                    count = await loc.count()
-                    if count:
+                    if await loc.count():
                         return loc.first
                 except Exception:
                     pass
-        await page.wait_for_timeout(400)
+        await page.wait_for_timeout(300)
     return None
 
 
-async def _upload_package(page, package: Path) -> None:
-    file_input = await _find_upload_input(page, timeout_ms=30000)
+async def _click_upload_file_and_choose(page, package: Path) -> bool:
+    """Use the visible H5P Hub 'Upload a file' button and Playwright's file chooser.
 
-    if not file_input:
+    The Imperial Learning H5P.com UI shown by the user exposes a visible
+    'Upload a file' button. On this UI the underlying <input type=file> can be
+    hidden or created lazily, so setting an arbitrary hidden input is not
+    reliable. Listening for the browser file chooser is the most robust path.
+    """
+    button_names = ["Upload a file", "Choose file", "Choose a file", "Browse"]
+
+    for scope in _scopes(page):
+        for name in button_names:
+            candidates = []
+            try:
+                candidates.append(scope.get_by_role("button", name=name, exact=False).first)
+            except Exception:
+                pass
+            try:
+                candidates.append(scope.get_by_text(name, exact=True).first)
+            except Exception:
+                pass
+
+            for loc in candidates:
+                try:
+                    await loc.wait_for(state="visible", timeout=1800)
+                except Exception:
+                    continue
+                try:
+                    async with page.expect_file_chooser(timeout=6000) as chooser_info:
+                        await loc.click(force=True)
+                    chooser = await chooser_info.value
+                    await chooser.set_files(str(package))
+                    print(f"[H5P] Selected package through file chooser: {package.name}", flush=True)
+                    return True
+                except Exception:
+                    # Some H5P Hub builds wire the button to an already-existing
+                    # hidden input instead of emitting a filechooser event.
+                    continue
+    return False
+
+
+async def _package_is_selected(page, package: Path) -> bool:
+    """Confirm that H5P Hub has actually received the selected file."""
+    expected = package.name.lower()
+
+    for scope in _scopes(page):
+        # Check native input FileList first.
+        try:
+            inputs = scope.locator('input[type="file"]')
+            for i in range(await inputs.count()):
+                loc = inputs.nth(i)
+                try:
+                    names = await loc.evaluate(
+                        "el => Array.from(el.files || []).map(f => f.name.toLowerCase())"
+                    )
+                    if expected in names:
+                        return True
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+        # H5P Hub also renders the chosen filename as text in many builds.
+        try:
+            body = (await scope.locator("body").inner_text()).lower()
+            if expected in body:
+                return True
+        except Exception:
+            pass
+
+    return False
+
+
+async def _wait_for_package_selected(page, package: Path, timeout_ms: int = 15000) -> None:
+    steps = max(1, timeout_ms // 350)
+    for _ in range(steps):
+        if await _package_is_selected(page, package):
+            return
+        await page.wait_for_timeout(350)
+    raise H5PAutomationError(
+        "H5P.com opened Upload mode, but the generated .h5p file was not selected."
+    )
+
+
+async def _editor_is_ready(page) -> bool:
+    """Detect when H5P has finished importing and the content editor is usable."""
+    for scope in _scopes(page):
+        try:
+            body = (await scope.locator("body").inner_text()).lower()
+        except Exception:
+            continue
+
+        # The validation message shown in the user's screenshot means import has
+        # NOT completed yet.
+        if "select content type or upload content" in body:
+            continue
+
+        # Common editor labels that appear after a content type/package loads.
+        ready_markers = [
+            "metadata",
+            "task description",
+            "behavioural settings",
+            "behavioral settings",
+            "overall feedback",
+            "tutorial",
+            "title *",
+            "title*",
+        ]
+        if any(marker in body for marker in ready_markers):
+            return True
+
+        # The H5P Hub header starts as 'Select content type'. Once a package is
+        # imported it normally changes to the actual activity type.
+        if "create or upload content" in body and "select content type" not in body:
+            return True
+
+    return False
+
+
+async def _wait_for_import_to_finish(page, timeout_ms: int = 120000) -> None:
+    """Wait until the uploaded package has been parsed into the H5P editor."""
+    steps = max(1, timeout_ms // 500)
+    for step in range(steps):
+        if await _editor_is_ready(page):
+            print("[H5P] Imported package is loaded in the editor.", flush=True)
+            return
+
+        # Some H5P Hub versions show a second explicit Import/Use/Continue action
+        # after the file is chosen. Do not click generic 'Upload' here because on
+        # the Imperial UI that is the radio tab, not an import confirmation.
+        if step % 4 == 0:
+            await _click_role_or_text(
+                page,
+                ["Import", "Use", "Continue", "Insert"],
+                timeout_ms=900,
+            )
+        await page.wait_for_timeout(500)
+
+    # Include a short body excerpt to make future selector issues diagnosable.
+    excerpt = ""
+    try:
+        excerpt = (await page.locator("body").inner_text()).replace("\n", " ")[:900]
+    except Exception:
+        pass
+    raise H5PAutomationError(
+        "The .h5p file was selected, but H5P.com did not finish importing it into the editor "
+        f"within 120 seconds. Page excerpt: {excerpt}"
+    )
+
+
+async def _upload_package(page, package: Path) -> None:
+    print("[H5P] Upload mode selected. Choosing generated package...", flush=True)
+
+    # Prefer the exact visible control in the Imperial Learning UI:
+    # 'Upload a file'. This handles lazily-created/hidden inputs correctly.
+    selected = await _click_upload_file_and_choose(page, package)
+
+    if not selected:
+        # Fallback for H5P builds exposing a stable hidden input.
+        file_input = await _find_upload_input(page, timeout_ms=12000)
+        if file_input:
+            try:
+                await file_input.set_input_files(str(package))
+                selected = True
+                print(f"[H5P] Selected package through hidden input: {package.name}", flush=True)
+            except Exception:
+                selected = False
+
+    if not selected:
         frame_info = []
         for frame in page.frames:
             try:
@@ -259,151 +417,120 @@ async def _upload_package(page, package: Path) -> None:
             frame_info.append(f"{frame.url or '<no-url>'} (file_inputs={count})")
         details = "; ".join(frame_info[:8]) or "no frames detected"
         raise H5PAutomationError(
-            "Could not find the H5P.com .h5p upload field after switching to Upload mode. "
+            "Could not activate the H5P.com 'Upload a file' control. "
             f"Frames checked: {details}"
         )
 
-    await file_input.set_input_files(str(package))
-
-    # Wait for H5P.com to process the selected package. Some versions do this
-    # automatically; others expose a separate Upload / Use / Import button.
-    await page.wait_for_timeout(1200)
-
-    # Only click an action button if one is visible. Search inside frames too.
-    await _click_role_or_text(page, ["Use", "Import", "Continue", "Upload"], timeout_ms=1800)
-
-    # Wait for the editor to replace the upload panel. Avoid networkidle because
-    # H5P editor pages can keep background requests alive.
-    await page.wait_for_timeout(2500)
+    await _wait_for_package_selected(page, package, timeout_ms=15000)
+    print("[H5P] Generated .h5p file selected successfully.", flush=True)
+    await _wait_for_import_to_finish(page, timeout_ms=120000)
 
 
-async def _visible_control_texts(page, limit: int = 30) -> list[str]:
-    """Return visible button/link control labels for diagnostics."""
-    found = []
+async def _find_save_control(page, timeout_ms: int = 30000):
+    """Find H5P.com's outer-shell Save control after the editor is ready."""
     selectors = [
-        'button',
-        '[role="button"]',
-        'input[type="submit"]',
-        'input[type="button"]',
-        'a',
-    ]
-    for scope in _scopes(page):
-        for selector in selectors:
-            try:
-                loc = scope.locator(selector)
-                count = min(await loc.count(), 40)
-                for i in range(count):
-                    el = loc.nth(i)
-                    try:
-                        if not await el.is_visible():
-                            continue
-                        text = (await el.inner_text()).strip()
-                    except Exception:
-                        text = ""
-                    if not text:
-                        try:
-                            text = (await el.get_attribute("value") or "").strip()
-                        except Exception:
-                            text = ""
-                    if text and text not in found:
-                        found.append(text)
-                        if len(found) >= limit:
-                            return found
-            except Exception:
-                continue
-    return found
-
-
-async def _find_save_control(page, timeout_ms: int = 90000):
-    """Wait for H5P.com to finish importing and expose a Save control.
-
-    Large .h5p packages can take considerably longer than a few seconds to
-    unpack and initialise in the editor. The previous automation looked for
-    Save almost immediately, which caused false failures.
-    """
-    selectors = [
-        'button:text-is("Save")',
         'button:has-text("Save")',
-        '[role="button"]:has-text("Save")',
-        'input[type="submit"][value="Save"]',
-        'input[type="button"][value="Save"]',
-        'input[type="submit"][value*="save" i]',
-        'input[type="button"][value*="save" i]',
-        '[data-testid*="save" i]',
-        '[id*="save" i]',
-        '[class*="save" i]',
+        'input[type="submit"][value="Save" i]',
+        'input[type="button"][value="Save" i]',
         'a:has-text("Save")',
+        '[role="button"]:has-text("Save")',
+        '[class*="save" i]',
     ]
 
-    steps = max(1, timeout_ms // 1000)
-    for step in range(steps):
-        # H5P.com normally places Save in the outer shell, but search frames too.
-        for scope in _scopes(page):
+    steps = max(1, timeout_ms // 400)
+    for _ in range(steps):
+        # Top-level page first: the user's screenshot shows Save in H5P.com's
+        # outer header, not inside the Hub frame.
+        scopes = [page] + [s for s in _scopes(page) if s is not page]
+        for scope in scopes:
+            for selector in selectors:
+                try:
+                    locs = scope.locator(selector)
+                    count = await locs.count()
+                    for i in range(count):
+                        loc = locs.nth(i)
+                        if not await loc.is_visible():
+                            continue
+                        disabled = await loc.get_attribute("disabled")
+                        aria_disabled = await loc.get_attribute("aria-disabled")
+                        if disabled is not None or (aria_disabled or "").lower() == "true":
+                            continue
+                        return loc
+                except Exception:
+                    pass
+
+            # Accessible-name fallback.
             try:
                 loc = scope.get_by_role("button", name="Save", exact=True).first
-                if await loc.count() and await loc.is_visible():
+                if await loc.is_visible() and await loc.is_enabled():
                     return loc
             except Exception:
                 pass
-
-            for selector in selectors:
-                try:
-                    loc = scope.locator(selector).first
-                    if await loc.count() and await loc.is_visible():
-                        return loc
-                except Exception:
-                    continue
-
-        # Some H5P packages expose an Import/Use/Continue action only after
-        # server-side validation has completed. Click it if it appears.
-        if step in {2, 5, 10, 20, 35, 50}:
-            try:
-                await _click_role_or_text(page, ["Use", "Import", "Continue"], timeout_ms=900)
-            except Exception:
-                pass
-
-        await page.wait_for_timeout(1000)
-
+        await page.wait_for_timeout(400)
     return None
 
 
 async def _save_content(page) -> str:
-    save = await _find_save_control(page, timeout_ms=90000)
+    # Import must already be complete before Save is clicked. The Save button is
+    # visible even on an empty H5P create form, so clicking too early only triggers
+    # 'Select content type or upload content.' validation.
+    if not await _editor_is_ready(page):
+        await _wait_for_import_to_finish(page, timeout_ms=120000)
+
+    save = await _find_save_control(page, timeout_ms=30000)
     if not save:
-        controls = await _visible_control_texts(page)
+        buttons = []
         try:
-            body = (await page.locator("body").inner_text())[:1400].replace("\n", " | ")
-        except Exception:
-            body = ""
-        raise H5PAutomationError(
-            "H5P.com Save button was not found after waiting for the imported editor to load. "
-            f"Current URL: {page.url}. "
-            f"Visible controls: {controls[:20]}. "
-            f"Page text: {body[:900]}"
-        )
-
-    old_url = page.url
-    try:
-        await save.scroll_into_view_if_needed()
-    except Exception:
-        pass
-
-    try:
-        await save.click(timeout=10000)
-    except Exception:
-        await save.click(force=True, timeout=10000)
-
-    # Saving normally navigates from /content/create to /content/<id>.
-    try:
-        await page.wait_for_url(lambda url: str(url) != old_url, timeout=30000)
-    except Exception:
-        try:
-            await page.wait_for_load_state("domcontentloaded", timeout=10000)
+            texts = await page.locator("button").all_inner_texts()
+            buttons = [x.strip() for x in texts if x.strip()][:20]
         except Exception:
             pass
+        raise H5PAutomationError(
+            "The H5P activity imported, but the H5P.com Save control could not be located. "
+            f"Visible top-level buttons: {buttons}"
+        )
 
-    await page.wait_for_timeout(1500)
-    return page.url
+    print("[H5P] Clicking Save...", flush=True)
+    old_url = page.url
+    try:
+        await save.click(force=True)
+    except Exception as exc:
+        raise H5PAutomationError(f"H5P.com Save button was found but could not be clicked: {exc}") from exc
+
+    # Wait for H5P.com to leave /content/create and return the new content URL.
+    steps = 180  # up to 90 seconds
+    for _ in range(steps):
+        current = page.url
+        if current != old_url and "/content/create" not in current:
+            print(f"[H5P] Saved activity: {current}", flush=True)
+            return current
+
+        # Some H5P.com saves update history/state without a full navigation.
+        if "/content/" in current and not current.rstrip("/").endswith("/content/create"):
+            print(f"[H5P] Saved activity: {current}", flush=True)
+            return current
+
+        # Detect validation/errors instead of waiting forever.
+        try:
+            body = (await page.locator("body").inner_text()).lower()
+            if "select content type or upload content" in body:
+                raise H5PAutomationError(
+                    "H5P.com rejected Save because the uploaded package had not been imported into the editor."
+                )
+        except H5PAutomationError:
+            raise
+        except Exception:
+            pass
+        await page.wait_for_timeout(500)
+
+    # If no redirect occurred, return the current URL only if it already looks
+    # like a saved content URL; otherwise treat it as a failed save.
+    current = page.url
+    if "/content/" in current and "/content/create" not in current:
+        return current
+    raise H5PAutomationError(
+        "H5P.com Save was clicked, but no saved content URL appeared within 90 seconds."
+    )
 
 
 async def _inspect_test_target(page, target_url: str) -> dict:
