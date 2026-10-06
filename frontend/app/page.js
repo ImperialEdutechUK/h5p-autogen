@@ -137,41 +137,102 @@ export default function Home() {
   async function publishToH5P() {
     if (!result?.job_id) return;
 
-    // Open the tab immediately while this click is still a direct user gesture.
-    // Browsers may block window.open() when it is called only after an async fetch finishes.
+    // Open the target tab immediately from the click so popup blockers do not stop it.
     const h5pWindow = window.open("about:blank", "_blank");
     if (h5pWindow) {
       h5pWindow.document.title = "Publishing to H5P...";
       h5pWindow.document.body.innerHTML =
-        '<div style="font-family:Arial,sans-serif;padding:32px"><h2>Publishing to H5P...</h2><p>Please keep this tab open while the activity is uploaded and saved.</p></div>';
+        '<div style="font-family:Arial,sans-serif;padding:32px"><h2>Publishing to H5P...</h2><p>The upload is running in the background. Please keep this tab open.</p></div>';
     }
 
     setBusy(true);
     setError("");
-    setMessage("Publishing to H5P...");
+    setMessage("Starting H5P publish...");
+
+    const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
     try {
-      const r = await fetch(`${API_URL}/api/jobs/${result.job_id}/publish-to-h5p`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ auto_save: true, inspect_test_target: false }),
-      });
-      const data = await r.json().catch(() => ({}));
-      if (!r.ok) throw new Error(toErrorMessage(data.detail) || "Failed to publish to H5P.");
-
-      const finalUrl = data.url || data.edit_url || data.content_url;
-      if (!finalUrl) throw new Error("H5P published successfully, but no content URL was returned.");
-
-      setMessage("Published to H5P successfully. Opening the H5P activity...");
-
-      if (h5pWindow && !h5pWindow.closed) {
-        h5pWindow.location.href = finalUrl;
-      } else {
-        window.location.href = finalUrl;
+      // Start the long-running Playwright task. This endpoint now returns immediately.
+      const startResponse = await fetch(
+        `${API_URL}/api/jobs/${result.job_id}/publish-to-h5p`,
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ auto_save: true, inspect_test_target: false }),
+        }
+      );
+      const startData = await startResponse.json().catch(() => ({}));
+      if (!startResponse.ok) {
+        throw new Error(toErrorMessage(startData.detail) || "Could not start H5P publishing.");
       }
+
+      const publishJobId = startData.publish_job_id;
+      if (!publishJobId) throw new Error("Backend did not return an H5P publish job ID.");
+
+      setMessage("Publishing to H5P... You can keep using this page while it finishes.");
+
+      // Poll instead of keeping one HTTP request open for several minutes.
+      const deadline = Date.now() + 10 * 60 * 1000;
+      let consecutiveNetworkErrors = 0;
+
+      while (Date.now() < deadline) {
+        await sleep(2500);
+
+        try {
+          const statusResponse = await fetch(
+            `${API_URL}/api/h5p/publish-jobs/${publishJobId}`,
+            { cache: "no-store" }
+          );
+          const statusData = await statusResponse.json().catch(() => ({}));
+
+          if (!statusResponse.ok) {
+            throw new Error(toErrorMessage(statusData.detail) || `Status check failed (${statusResponse.status}).`);
+          }
+
+          consecutiveNetworkErrors = 0;
+          const status = statusData.status;
+
+          if (status === "completed") {
+            const finalUrl =
+              statusData.url ||
+              statusData.result?.url ||
+              statusData.result?.edit_url ||
+              statusData.result?.content_url;
+
+            if (!finalUrl) {
+              throw new Error("H5P publishing completed, but no H5P content URL was returned.");
+            }
+
+            setMessage("Published to H5P successfully. Opening the activity...");
+            if (h5pWindow && !h5pWindow.closed) {
+              h5pWindow.location.replace(finalUrl);
+            } else {
+              window.open(finalUrl, "_blank", "noopener,noreferrer");
+            }
+            return;
+          }
+
+          if (status === "failed") {
+            throw new Error(statusData.error || statusData.message || "H5P publishing failed.");
+          }
+
+          if (statusData.message) setMessage(statusData.message);
+        } catch (pollError) {
+          consecutiveNetworkErrors += 1;
+          // Railway/Vercel can briefly reset a connection. Retry a few times instead of
+          // immediately showing the generic browser "Failed to fetch" error.
+          if (consecutiveNetworkErrors >= 5) throw pollError;
+          setMessage("H5P is still publishing. Reconnecting to the backend...");
+        }
+      }
+
+      throw new Error("H5P publishing is taking longer than 10 minutes. Check Railway logs for the publish job.");
     } catch (e) {
-      if (h5pWindow && !h5pWindow.closed) h5pWindow.close();
-      setError(e.message);
+      if (h5pWindow && !h5pWindow.closed) {
+        h5pWindow.document.body.innerHTML =
+          `<div style="font-family:Arial,sans-serif;padding:32px"><h2>H5P publish did not finish</h2><p>${String(e.message || e)}</p><p>You can close this tab.</p></div>`;
+      }
+      setError(e.message || String(e));
       setMessage("");
     } finally {
       setBusy(false);

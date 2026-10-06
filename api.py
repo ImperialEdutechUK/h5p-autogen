@@ -7,7 +7,7 @@ import uuid
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+from fastapi import BackgroundTasks, FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
@@ -20,6 +20,8 @@ TEMPLATES_DIR = BASE_DIR / "templates"
 ARTIFACT_DIR = Path(os.getenv("ARTIFACT_DIR", "/tmp/h5p_autogen_jobs"))
 ARTIFACT_DIR.mkdir(parents=True, exist_ok=True)
 ARTIFACT_TTL_SECONDS = int(os.getenv("ARTIFACT_TTL_SECONDS", "7200"))
+PUBLISH_DIR = ARTIFACT_DIR / "_publish_jobs"
+PUBLISH_DIR.mkdir(parents=True, exist_ok=True)
 
 app = FastAPI(title="H5P Activity Generator API", version="2.0.0")
 origins_raw = os.getenv("FRONTEND_ORIGINS", "*").strip()
@@ -35,8 +37,17 @@ app.add_middleware(
 
 def _cleanup_old_jobs() -> None:
     now = time.time()
+    PUBLISH_DIR.mkdir(parents=True, exist_ok=True)
     for p in ARTIFACT_DIR.iterdir():
         try:
+            if p == PUBLISH_DIR:
+                for status_file in PUBLISH_DIR.glob("*.json"):
+                    try:
+                        if now - status_file.stat().st_mtime > ARTIFACT_TTL_SECONDS:
+                            status_file.unlink(missing_ok=True)
+                    except Exception:
+                        pass
+                continue
             if p.is_dir() and now - p.stat().st_mtime > ARTIFACT_TTL_SECONDS:
                 shutil.rmtree(p, ignore_errors=True)
         except Exception:
@@ -461,6 +472,74 @@ async def send_to_h5p(job_id: str, body: H5PSendRequest = H5PSendRequest()):
     except Exception as exc:
         raise HTTPException(status_code=400, detail=str(exc))
 
+def _publish_status_path(publish_job_id: str) -> Path:
+    return PUBLISH_DIR / f"{publish_job_id}.json"
+
+
+def _write_publish_status(publish_job_id: str, payload: Dict[str, Any]) -> None:
+    payload = dict(payload)
+    payload["publish_job_id"] = publish_job_id
+    payload["updated_at"] = time.time()
+    path = _publish_status_path(publish_job_id)
+    tmp = path.with_suffix(".tmp")
+    tmp.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+    tmp.replace(path)
+
+
+def _read_publish_status(publish_job_id: str) -> Dict[str, Any]:
+    path = _publish_status_path(publish_job_id)
+    if not path.exists():
+        raise HTTPException(status_code=404, detail="H5P publish job not found or expired.")
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Could not read H5P publish status: {exc}")
+
+
+async def _run_h5p_publish_job(
+    publish_job_id: str,
+    h5p_path: str,
+    auto_save: bool,
+    inspect_test_target: bool,
+) -> None:
+    _write_publish_status(
+        publish_job_id,
+        {
+            "status": "running",
+            "message": "Uploading generated package to H5P.com...",
+        },
+    )
+    try:
+        result = await automate_h5p_com_import(
+            h5p_path,
+            auto_save=auto_save,
+            inspect_test_target=inspect_test_target,
+        )
+        final_url = (
+            result.get("url")
+            or result.get("edit_url")
+            or result.get("content_url")
+        ) if isinstance(result, dict) else None
+        _write_publish_status(
+            publish_job_id,
+            {
+                "status": "completed",
+                "message": "Published to H5P successfully.",
+                "url": final_url,
+                "result": result,
+            },
+        )
+    except Exception as exc:
+        _write_publish_status(
+            publish_job_id,
+            {
+                "status": "failed",
+                "message": "H5P publish failed.",
+                "error": str(exc),
+            },
+        )
+
+
 class H5PBrowserRequest(BaseModel):
     auto_save: bool = True
     inspect_test_target: bool = True
@@ -475,18 +554,42 @@ async def h5p_automation_check():
         raise HTTPException(status_code=400, detail=str(exc))
 
 
-@app.post("/api/jobs/{job_id}/publish-to-h5p")
-async def publish_to_h5p(job_id: str, body: H5PBrowserRequest = H5PBrowserRequest()):
-    """Upload the generated .h5p to Imperial Learning H5P.com and save it."""
+@app.post("/api/jobs/{job_id}/publish-to-h5p", status_code=202)
+async def publish_to_h5p(
+    job_id: str,
+    background_tasks: BackgroundTasks,
+    body: H5PBrowserRequest = H5PBrowserRequest(),
+):
+    """Start H5P.com publishing in the background and return immediately."""
     job_dir = ARTIFACT_DIR / job_id
     files = list(job_dir.glob("*.h5p")) if job_dir.exists() else []
     if not files:
         raise HTTPException(status_code=404, detail="Generated H5P file not found or expired.")
-    try:
-        return await automate_h5p_com_import(
-            str(files[0]),
-            auto_save=body.auto_save,
-            inspect_test_target=body.inspect_test_target,
-        )
-    except Exception as exc:
-        raise HTTPException(status_code=400, detail=str(exc))
+
+    publish_job_id = uuid.uuid4().hex
+    _write_publish_status(
+        publish_job_id,
+        {
+            "status": "queued",
+            "message": "H5P publish job queued.",
+            "source_job_id": job_id,
+        },
+    )
+    background_tasks.add_task(
+        _run_h5p_publish_job,
+        publish_job_id,
+        str(files[0]),
+        body.auto_save,
+        body.inspect_test_target,
+    )
+    return {
+        "publish_job_id": publish_job_id,
+        "status": "queued",
+        "status_url": f"/api/h5p/publish-jobs/{publish_job_id}",
+    }
+
+
+@app.get("/api/h5p/publish-jobs/{publish_job_id}")
+def h5p_publish_status(publish_job_id: str):
+    """Return the current state of a background H5P.com publish job."""
+    return _read_publish_status(publish_job_id)
