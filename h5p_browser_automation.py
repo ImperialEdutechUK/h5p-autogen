@@ -14,10 +14,10 @@ def _env(name: str, default: str = "") -> str:
     return os.getenv(name, default).strip()
 
 
-async def _first_visible(page, selectors, timeout_ms: int = 2500):
+async def _first_visible(scope, selectors, timeout_ms: int = 2500):
     for selector in selectors:
         try:
-            loc = page.locator(selector).first
+            loc = scope.locator(selector).first
             await loc.wait_for(state="visible", timeout=timeout_ms)
             return loc
         except Exception:
@@ -25,23 +25,54 @@ async def _first_visible(page, selectors, timeout_ms: int = 2500):
     return None
 
 
-async def _click_role_or_text(page, names, timeout_ms: int = 2500) -> bool:
+async def _first_attached(scope, selectors, timeout_ms: int = 2500):
+    for selector in selectors:
+        try:
+            loc = scope.locator(selector).first
+            await loc.wait_for(state="attached", timeout=timeout_ms)
+            return loc
+        except Exception:
+            continue
+    return None
+
+
+def _scopes(page):
+    """Return the top-level page plus every currently attached frame.
+
+    H5P Hub/editor controls can be rendered in an iframe. Searching only the
+    top-level page misses the upload input on some H5P.com accounts.
+    """
+    scopes = [page]
+    for frame in page.frames:
+        if frame != page.main_frame:
+            scopes.append(frame)
+    return scopes
+
+
+async def _click_role_or_text_in_scope(scope, names, timeout_ms: int = 2500) -> bool:
     for name in names:
-        for role in ("button", "radio", "link"):
+        for role in ("button", "radio", "link", "tab"):
             try:
-                loc = page.get_by_role(role, name=name, exact=False).first
+                loc = scope.get_by_role(role, name=name, exact=False).first
                 await loc.wait_for(state="visible", timeout=timeout_ms)
                 await loc.click()
                 return True
             except Exception:
                 pass
         try:
-            loc = page.get_by_text(name, exact=True).first
+            loc = scope.get_by_text(name, exact=True).first
             await loc.wait_for(state="visible", timeout=timeout_ms)
             await loc.click()
             return True
         except Exception:
             pass
+    return False
+
+
+async def _click_role_or_text(page, names, timeout_ms: int = 2500) -> bool:
+    for scope in _scopes(page):
+        if await _click_role_or_text_in_scope(scope, names, timeout_ms=timeout_ms):
+            return True
     return False
 
 
@@ -56,17 +87,19 @@ async def _load_storage_state() -> Optional[dict]:
 
 
 async def _login_h5p(page) -> None:
-    """Log in to H5P.com when the browser is not already authenticated.
-
-    Supports normal email/username + password login. For SSO/MFA accounts use
-    H5P_STORAGE_STATE_JSON instead so Railway starts with an authenticated session.
-    """
+    """Log in to H5P.com when the browser is not already authenticated."""
     create_url = _env("H5P_CREATE_URL", "https://imperiallearning.h5p.com/content/create")
-    await page.goto(create_url, wait_until="domcontentloaded")
+
+    try:
+        await page.goto(create_url, wait_until="domcontentloaded", timeout=60000)
+    except Exception as exc:
+        # H5P.com can interrupt the original navigation while redirecting to login.
+        if "interrupted by another navigation" not in str(exc).lower():
+            raise
 
     # If Create New Content is already visible, the session is authenticated.
     try:
-        if await page.get_by_text("Create New Content", exact=False).first.is_visible(timeout=2500):
+        if await page.get_by_text("Create New Content", exact=False).first.is_visible(timeout=3500):
             return
     except Exception:
         pass
@@ -79,7 +112,6 @@ async def _login_h5p(page) -> None:
             "or provide H5P_STORAGE_STATE_JSON for SSO/MFA accounts."
         )
 
-    # H5P.com may redirect to a dedicated login page.
     user = await _first_visible(page, [
         'input[type="email"]',
         'input[name="email"]',
@@ -117,89 +149,155 @@ async def _login_h5p(page) -> None:
         raise H5PAutomationError("H5P.com login did not reach the Create New Content page.") from exc
 
 
+async def _wait_for_h5p_hub(page, timeout_ms: int = 30000) -> None:
+    """Wait for the H5P Hub create/upload widget to finish loading."""
+    deadline_steps = max(1, timeout_ms // 500)
+    for _ in range(deadline_steps):
+        for scope in _scopes(page):
+            try:
+                # The user's H5P.com page shows Create Content / Upload inside the hub.
+                upload = scope.get_by_text("Upload", exact=True).first
+                if await upload.count() and await upload.is_visible():
+                    return
+            except Exception:
+                pass
+            try:
+                if await scope.locator('input[type="radio"]').count():
+                    txt = (await scope.locator("body").inner_text()).lower()
+                    if "upload" in txt and "create content" in txt:
+                        return
+            except Exception:
+                pass
+        await page.wait_for_timeout(500)
+    raise H5PAutomationError("H5P Hub did not finish loading the Create Content / Upload controls.")
+
+
 async def _select_upload_mode(page) -> None:
-    # The H5P.com create page shown by the user has Create Content / Upload radio choices.
-    try:
-        radio = page.get_by_role("radio", name="Upload", exact=False).first
-        await radio.wait_for(state="attached", timeout=5000)
-        await radio.check(force=True)
-        return
-    except Exception:
-        pass
+    await _wait_for_h5p_hub(page)
 
-    # Fallback to visible label/text.
-    if await _click_role_or_text(page, ["Upload"], timeout_ms=3500):
-        return
-
-    # JS/label fallback used by some H5P Hub builds.
-    candidates = [
-        'label:has-text("Upload")',
-        'input[type="radio"][value*="upload" i]',
-        '[class*="upload"] input[type="radio"]',
-    ]
-    for sel in candidates:
+    # Search both the top-level page and any iframe used by H5P Hub.
+    for scope in _scopes(page):
         try:
-            loc = page.locator(sel).first
-            await loc.wait_for(state="attached", timeout=2000)
-            await loc.click(force=True)
+            radio = scope.get_by_role("radio", name="Upload", exact=False).first
+            await radio.wait_for(state="attached", timeout=1500)
+            try:
+                await radio.check(force=True)
+            except Exception:
+                await radio.click(force=True)
+            await page.wait_for_timeout(700)
             return
         except Exception:
             pass
+
+    # Common H5P Hub markup fallbacks.
+    selectors = [
+        'label:has-text("Upload")',
+        'input[type="radio"][value*="upload" i]',
+        'input[type="radio"][id*="upload" i]',
+        '[class*="upload" i] input[type="radio"]',
+        '[class*="h5p"] label:has-text("Upload")',
+    ]
+    for scope in _scopes(page):
+        for sel in selectors:
+            try:
+                loc = scope.locator(sel).first
+                await loc.wait_for(state="attached", timeout=1200)
+                await loc.click(force=True)
+                await page.wait_for_timeout(700)
+                return
+            except Exception:
+                pass
+
+    if await _click_role_or_text(page, ["Upload"], timeout_ms=2000):
+        await page.wait_for_timeout(700)
+        return
+
     raise H5PAutomationError("Could not switch H5P.com to Upload mode.")
 
 
-async def _upload_package(page, package: Path) -> None:
-    file_input = None
-    for _ in range(10):
-        file_input = await _first_visible(page, [
-            'input[type="file"][accept*="h5p" i]',
-            'input[type="file"][name*="h5p" i]',
-            'input[type="file"]',
-        ], timeout_ms=700)
-        if file_input:
-            break
+async def _find_upload_input(page, timeout_ms: int = 30000):
+    """Find the .h5p file input in the page OR an embedded H5P Hub frame.
+
+    The input is commonly hidden, so this function deliberately looks for
+    attached elements rather than requiring visibility.
+    """
+    selectors = [
+        'input[type="file"][accept*=".h5p" i]',
+        'input[type="file"][accept*="h5p" i]',
+        'input[type="file"][name*="h5p" i]',
+        'input[type="file"][id*="h5p" i]',
+        'input[type="file"][class*="h5p" i]',
+        'input[type="file"]',
+    ]
+
+    steps = max(1, timeout_ms // 400)
+    for _ in range(steps):
+        # Frames can appear after the H5P Hub loads, so rebuild scopes each loop.
+        for scope in _scopes(page):
+            for selector in selectors:
+                try:
+                    loc = scope.locator(selector)
+                    count = await loc.count()
+                    if count:
+                        return loc.first
+                except Exception:
+                    pass
         await page.wait_for_timeout(400)
+    return None
+
+
+async def _upload_package(page, package: Path) -> None:
+    file_input = await _find_upload_input(page, timeout_ms=30000)
 
     if not file_input:
-        # Hidden file inputs are common, so search attached elements as a final fallback.
-        try:
-            attached = page.locator('input[type="file"]').first
-            await attached.wait_for(state="attached", timeout=3000)
-            file_input = attached
-        except Exception:
-            pass
-
-    if not file_input:
-        raise H5PAutomationError("Could not find the H5P.com .h5p upload field.")
+        frame_info = []
+        for frame in page.frames:
+            try:
+                count = await frame.locator('input[type="file"]').count()
+            except Exception:
+                count = -1
+            frame_info.append(f"{frame.url or '<no-url>'} (file_inputs={count})")
+        details = "; ".join(frame_info[:8]) or "no frames detected"
+        raise H5PAutomationError(
+            "Could not find the H5P.com .h5p upload field after switching to Upload mode. "
+            f"Frames checked: {details}"
+        )
 
     await file_input.set_input_files(str(package))
 
-    # H5P.com may automatically import after file selection or expose an Upload/Use button.
-    await _click_role_or_text(page, ["Upload", "Use", "Import", "Continue"], timeout_ms=1800)
-    await page.wait_for_timeout(1800)
+    # Wait for H5P.com to process the selected package. Some versions do this
+    # automatically; others expose a separate Upload / Use / Import button.
+    await page.wait_for_timeout(1200)
+
+    # Only click an action button if one is visible. Search inside frames too.
+    await _click_role_or_text(page, ["Use", "Import", "Continue", "Upload"], timeout_ms=1800)
+
+    # Wait for the editor to replace the upload panel. Avoid networkidle because
+    # H5P editor pages can keep background requests alive.
+    await page.wait_for_timeout(2500)
 
 
 async def _save_content(page) -> str:
-    # Top-right H5P.com button in the user's screenshot.
-    saved = await _click_role_or_text(page, ["Save"], timeout_ms=6000)
+    # Save is on the H5P.com shell in the user's screenshot. Search all scopes as fallback.
+    saved = await _click_role_or_text(page, ["Save"], timeout_ms=7000)
     if not saved:
         raise H5PAutomationError("H5P.com Save button was not found after import.")
 
+    # Saving may navigate to /content/<id>. Wait for either navigation or URL change.
+    old_url = page.url
     try:
-        await page.wait_for_load_state("networkidle", timeout=18000)
+        await page.wait_for_url(lambda url: str(url) != old_url, timeout=18000)
     except Exception:
-        pass
+        try:
+            await page.wait_for_load_state("domcontentloaded", timeout=8000)
+        except Exception:
+            pass
     await page.wait_for_timeout(1200)
     return page.url
 
 
 async def _inspect_test_target(page, target_url: str) -> dict:
-    """Visit the user's testing URL and return what the automation can observe.
-
-    This does not assume that /content/<id> is a folder. It records the page title and
-    whether folder/content-edit controls are visible so we do not accidentally move or
-    overwrite content based on an incorrect assumption.
-    """
+    """Visit the configured testing URL and report what is visible."""
     if not target_url:
         return {"configured": False}
     original = page.url
@@ -212,7 +310,7 @@ async def _inspect_test_target(page, target_url: str) -> dict:
         kind = "unknown"
         if "create new content" in lower:
             kind = "create"
-        elif "edit content" in lower or "save" in lower and "content" in lower:
+        elif "edit content" in lower or ("save" in lower and "content" in lower):
             kind = "content"
         elif "folder" in lower or "move to" in lower:
             kind = "folder_or_collection"
@@ -238,9 +336,6 @@ async def automate_h5p_com_import(
     """Import a generated .h5p package into Imperial Learning's H5P.com account.
 
     Flow: authenticate -> /content/create -> Upload -> choose .h5p -> Save -> return URL.
-    The configured H5P_TEST_TARGET_URL is inspected but is NOT treated as a folder unless
-    the page itself proves that it is one. This protects existing H5P content from being
-    overwritten accidentally during testing.
     """
     package = Path(h5p_path)
     if not package.exists():
@@ -278,6 +373,7 @@ async def automate_h5p_com_import(
             except Exception as exc:
                 raise H5PAutomationError("H5P.com Create New Content page did not load.") from exc
 
+            await _wait_for_h5p_hub(page)
             await _select_upload_mode(page)
             await _upload_package(page, package)
 

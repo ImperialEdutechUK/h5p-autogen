@@ -136,9 +136,19 @@ export default function Home() {
 
   async function publishToH5P() {
     if (!result?.job_id) return;
+
+    // Open the tab immediately while this click is still a direct user gesture.
+    // Browsers may block window.open() when it is called only after an async fetch finishes.
+    const h5pWindow = window.open("about:blank", "_blank");
+    if (h5pWindow) {
+      h5pWindow.document.title = "Publishing to H5P...";
+      h5pWindow.document.body.innerHTML =
+        '<div style="font-family:Arial,sans-serif;padding:32px"><h2>Publishing to H5P...</h2><p>Please keep this tab open while the activity is uploaded and saved.</p></div>';
+    }
+
     setBusy(true);
     setError("");
-    setMessage("");
+    setMessage("Publishing to H5P...");
 
     try {
       const r = await fetch(`${API_URL}/api/jobs/${result.job_id}/publish-to-h5p`, {
@@ -150,10 +160,19 @@ export default function Home() {
       if (!r.ok) throw new Error(toErrorMessage(data.detail) || "Failed to publish to H5P.");
 
       const finalUrl = data.url || data.edit_url || data.content_url;
-      setMessage("Published to H5P successfully.");
-      if (finalUrl) window.open(finalUrl, "_blank", "noopener,noreferrer");
+      if (!finalUrl) throw new Error("H5P published successfully, but no content URL was returned.");
+
+      setMessage("Published to H5P successfully. Opening the H5P activity...");
+
+      if (h5pWindow && !h5pWindow.closed) {
+        h5pWindow.location.href = finalUrl;
+      } else {
+        window.location.href = finalUrl;
+      }
     } catch (e) {
+      if (h5pWindow && !h5pWindow.closed) h5pWindow.close();
       setError(e.message);
+      setMessage("");
     } finally {
       setBusy(false);
     }
