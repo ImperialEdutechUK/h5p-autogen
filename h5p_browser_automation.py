@@ -277,22 +277,132 @@ async def _upload_package(page, package: Path) -> None:
     await page.wait_for_timeout(2500)
 
 
-async def _save_content(page) -> str:
-    # Save is on the H5P.com shell in the user's screenshot. Search all scopes as fallback.
-    saved = await _click_role_or_text(page, ["Save"], timeout_ms=7000)
-    if not saved:
-        raise H5PAutomationError("H5P.com Save button was not found after import.")
+async def _visible_control_texts(page, limit: int = 30) -> list[str]:
+    """Return visible button/link control labels for diagnostics."""
+    found = []
+    selectors = [
+        'button',
+        '[role="button"]',
+        'input[type="submit"]',
+        'input[type="button"]',
+        'a',
+    ]
+    for scope in _scopes(page):
+        for selector in selectors:
+            try:
+                loc = scope.locator(selector)
+                count = min(await loc.count(), 40)
+                for i in range(count):
+                    el = loc.nth(i)
+                    try:
+                        if not await el.is_visible():
+                            continue
+                        text = (await el.inner_text()).strip()
+                    except Exception:
+                        text = ""
+                    if not text:
+                        try:
+                            text = (await el.get_attribute("value") or "").strip()
+                        except Exception:
+                            text = ""
+                    if text and text not in found:
+                        found.append(text)
+                        if len(found) >= limit:
+                            return found
+            except Exception:
+                continue
+    return found
 
-    # Saving may navigate to /content/<id>. Wait for either navigation or URL change.
+
+async def _find_save_control(page, timeout_ms: int = 90000):
+    """Wait for H5P.com to finish importing and expose a Save control.
+
+    Large .h5p packages can take considerably longer than a few seconds to
+    unpack and initialise in the editor. The previous automation looked for
+    Save almost immediately, which caused false failures.
+    """
+    selectors = [
+        'button:text-is("Save")',
+        'button:has-text("Save")',
+        '[role="button"]:has-text("Save")',
+        'input[type="submit"][value="Save"]',
+        'input[type="button"][value="Save"]',
+        'input[type="submit"][value*="save" i]',
+        'input[type="button"][value*="save" i]',
+        '[data-testid*="save" i]',
+        '[id*="save" i]',
+        '[class*="save" i]',
+        'a:has-text("Save")',
+    ]
+
+    steps = max(1, timeout_ms // 1000)
+    for step in range(steps):
+        # H5P.com normally places Save in the outer shell, but search frames too.
+        for scope in _scopes(page):
+            try:
+                loc = scope.get_by_role("button", name="Save", exact=True).first
+                if await loc.count() and await loc.is_visible():
+                    return loc
+            except Exception:
+                pass
+
+            for selector in selectors:
+                try:
+                    loc = scope.locator(selector).first
+                    if await loc.count() and await loc.is_visible():
+                        return loc
+                except Exception:
+                    continue
+
+        # Some H5P packages expose an Import/Use/Continue action only after
+        # server-side validation has completed. Click it if it appears.
+        if step in {2, 5, 10, 20, 35, 50}:
+            try:
+                await _click_role_or_text(page, ["Use", "Import", "Continue"], timeout_ms=900)
+            except Exception:
+                pass
+
+        await page.wait_for_timeout(1000)
+
+    return None
+
+
+async def _save_content(page) -> str:
+    save = await _find_save_control(page, timeout_ms=90000)
+    if not save:
+        controls = await _visible_control_texts(page)
+        try:
+            body = (await page.locator("body").inner_text())[:1400].replace("\n", " | ")
+        except Exception:
+            body = ""
+        raise H5PAutomationError(
+            "H5P.com Save button was not found after waiting for the imported editor to load. "
+            f"Current URL: {page.url}. "
+            f"Visible controls: {controls[:20]}. "
+            f"Page text: {body[:900]}"
+        )
+
     old_url = page.url
     try:
-        await page.wait_for_url(lambda url: str(url) != old_url, timeout=18000)
+        await save.scroll_into_view_if_needed()
+    except Exception:
+        pass
+
+    try:
+        await save.click(timeout=10000)
+    except Exception:
+        await save.click(force=True, timeout=10000)
+
+    # Saving normally navigates from /content/create to /content/<id>.
+    try:
+        await page.wait_for_url(lambda url: str(url) != old_url, timeout=30000)
     except Exception:
         try:
-            await page.wait_for_load_state("domcontentloaded", timeout=8000)
+            await page.wait_for_load_state("domcontentloaded", timeout=10000)
         except Exception:
             pass
-    await page.wait_for_timeout(1200)
+
+    await page.wait_for_timeout(1500)
     return page.url
 
 
