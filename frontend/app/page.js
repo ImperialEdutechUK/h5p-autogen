@@ -22,6 +22,7 @@ function toErrorMessage(detail) {
 
 export default function Home() {
   const [activityTypes, setActivityTypes] = useState([]);
+  const [suggestions, setSuggestions] = useState([]);
   const [courseName, setCourseName] = useState("");
   const [unitName, setUnitName] = useState("");
   const [pdfs, setPdfs] = useState([]);
@@ -79,10 +80,20 @@ export default function Home() {
       const recs = data.recommendations || [];
       if (recs.length) {
         const names = recs.map((x) => x.activity_type).filter(Boolean);
+        const first = recs[0] || {};
+        const suggestedCount = Number(first.suggested_item_count);
+
+        setSuggestions(recs);
         setActivityTypes(names);
         setActivityType(names[0] || "");
-        setMessage(`Suggested ${names.length} H5P activity type(s).`);
+
+        if (Number.isFinite(suggestedCount) && suggestedCount > 0) {
+          setItemCount(Math.min(20, Math.max(1, suggestedCount)));
+        }
+
+        setMessage(`Suggested ${names.length} H5P activity type(s). Select one below.`);
       } else {
+        setSuggestions([]);
         setMessage("No recommendations returned.");
       }
     } catch (e) {
@@ -187,6 +198,67 @@ export default function Home() {
         </label>
         <button className="secondary" onClick={suggestTypes} disabled={busy}>Suggest H5P types</button>
       </section>
+
+      {suggestions.length > 0 && (
+        <section className="card suggestions-card">
+          <div className="suggestions-heading-row">
+            <div>
+              <p className="suggestions-kicker">AI recommendations</p>
+              <h2>Suggested H5P activities</h2>
+            </div>
+            <span className="suggestions-count">{suggestions.length} suggested</span>
+          </div>
+
+          <p className="suggestion-intro">
+            These activities were recommended from the uploaded teaching content. Select one to use it for generation.
+          </p>
+
+          <div className="suggestions-grid">
+            {suggestions.map((rec, index) => {
+              const isSelected = activityType === rec.activity_type;
+              const templateUnavailable = rec.template_ok === false;
+              const suggestedCount = Number(rec.suggested_item_count);
+
+              return (
+                <button
+                  type="button"
+                  key={`${rec.activity_type}-${index}`}
+                  className={`suggestion-card ${isSelected ? "selected" : ""} ${templateUnavailable ? "unavailable" : ""}`}
+                  disabled={busy || templateUnavailable}
+                  onClick={() => {
+                    setActivityType(rec.activity_type);
+                    if (Number.isFinite(suggestedCount) && suggestedCount > 0) {
+                      setItemCount(Math.min(20, Math.max(1, suggestedCount)));
+                    }
+                  }}
+                  aria-pressed={isSelected}
+                >
+                  <div className="suggestion-top">
+                    <div className="suggestion-rank">#{index + 1}</div>
+                    <strong>{rec.activity_type}</strong>
+                    {rec.score_0_to_5 !== undefined && rec.score_0_to_5 !== null && (
+                      <span className="suggestion-score">{rec.score_0_to_5}/5</span>
+                    )}
+                  </div>
+
+                  {rec.why && <p className="suggestion-reason">{rec.why}</p>}
+
+                  <div className="suggestion-meta">
+                    {Number.isFinite(suggestedCount) && suggestedCount > 0 && (
+                      <span>Suggested items: {suggestedCount}</span>
+                    )}
+                    {templateUnavailable && <span className="template-warning">Template unavailable</span>}
+                  </div>
+
+                  {isSelected && !templateUnavailable && (
+                    <span className="selected-label">Selected</span>
+                  )}
+                </button>
+              );
+            })}
+          </div>
+        </section>
+      )}
 
       <section className="card">
         <h2>3. Generate activity</h2>
