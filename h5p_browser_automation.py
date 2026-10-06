@@ -216,68 +216,164 @@ async def _select_upload_mode(page) -> None:
     raise H5PAutomationError("Could not switch H5P.com to Upload mode.")
 
 
-async def _find_upload_input(page, timeout_ms: int = 12000):
-    """Find any attached file input used by the H5P Hub upload control."""
-    selectors = [
-        'input[type="file"][accept*=".h5p" i]',
-        'input[type="file"][accept*="h5p" i]',
-        'input[type="file"][name*="h5p" i]',
-        'input[type="file"][id*="h5p" i]',
-        'input[type="file"]',
-    ]
+async def _find_upload_input(page, timeout_ms: int = 15000):
+    """Find the file input that belongs to the *visible H5P package uploader*.
 
-    steps = max(1, timeout_ms // 300)
+    H5P.com can keep more than one hidden ``input[type=file]`` in the DOM. The
+    old automation used the first file input it found, which could belong to a
+    different widget. Railway logs then reported that the file was selected,
+    but H5P Hub never started importing it.
+
+    This version scores each file input by its own attributes and by text in
+    nearby ancestors. It only returns an input that is clearly associated with
+    the H5P Hub panel containing "Upload an H5P file" / "Upload a file".
+    """
+    steps = max(1, timeout_ms // 350)
+
     for _ in range(steps):
+        best = None  # (score, scope, index, details)
+
         for scope in _scopes(page):
-            for selector in selectors:
+            try:
+                inputs = scope.locator('input[type="file"]')
+                count = await inputs.count()
+            except Exception:
+                continue
+
+            for i in range(count):
+                loc = inputs.nth(i)
                 try:
-                    loc = scope.locator(selector)
-                    if await loc.count():
-                        return loc.first
+                    info = await loc.evaluate(
+                        """el => {
+                          const lower = v => String(v || '').toLowerCase();
+                          const accept = lower(el.getAttribute('accept'));
+                          const name = lower(el.getAttribute('name'));
+                          const id = lower(el.getAttribute('id'));
+                          const cls = lower(el.getAttribute('class'));
+                          let score = 0;
+                          if (accept.includes('h5p') || accept.includes('.h5p')) score += 120;
+                          if (name.includes('h5p')) score += 70;
+                          if (id.includes('h5p')) score += 70;
+                          if (cls.includes('h5p')) score += 35;
+
+                          let context = '';
+                          let p = el.parentElement;
+                          for (let depth = 0; p && depth < 8; depth++, p = p.parentElement) {
+                            if (p.tagName === 'BODY' || p.tagName === 'HTML') break;
+                            const t = lower(p.innerText).replace(/\\s+/g, ' ').trim();
+                            if (!t) continue;
+                            if (!context || t.length < context.length) context = t;
+                            if (t.includes('upload an h5p file')) score += 150;
+                            if (t.includes('upload a file')) score += 100;
+                            if (t.includes('no file chosen')) score += 40;
+                            if (t.includes('create content') && t.includes('upload')) score += 15;
+                          }
+
+                          return {
+                            score,
+                            accept,
+                            name,
+                            id,
+                            cls,
+                            context: context.slice(0, 260)
+                          };
+                        }"""
+                    )
                 except Exception:
-                    pass
-        await page.wait_for_timeout(300)
+                    continue
+
+                score = int((info or {}).get('score') or 0)
+                if best is None or score > best[0]:
+                    best = (score, scope, i, info or {})
+
+        if best and best[0] >= 80:
+            score, scope, index, info = best
+            print(
+                "[H5P] Matched H5P package input "
+                f"(score={score}, accept={info.get('accept')!r}, "
+                f"name={info.get('name')!r}, id={info.get('id')!r}, "
+                f"context={info.get('context')!r}).",
+                flush=True,
+            )
+            return scope.locator('input[type="file"]').nth(index)
+
+        await page.wait_for_timeout(350)
+
     return None
 
 
 async def _click_upload_file_and_choose(page, package: Path) -> bool:
-    """Use the visible H5P Hub 'Upload a file' button and Playwright's file chooser.
+    """Choose the package through the actual visible H5P Hub upload control.
 
-    The Imperial Learning H5P.com UI shown by the user exposes a visible
-    'Upload a file' button. On this UI the underlying <input type=file> can be
-    hidden or created lazily, so setting an arbitrary hidden input is not
-    reliable. Listening for the browser file chooser is the most robust path.
+    First target the hidden input that is contextually linked to the visible
+    "Upload an H5P file" panel. This is more reliable in headless Chromium than
+    choosing an arbitrary hidden file input. If the input is created only after
+    clicking the styled button, fall back to the browser file chooser.
     """
-    button_names = ["Upload a file", "Choose file", "Choose a file", "Browse"]
+    # Fast path: use the file input belonging to the visible H5P package panel.
+    contextual_input = await _find_upload_input(page, timeout_ms=6000)
+    if contextual_input is not None:
+        try:
+            await contextual_input.set_input_files(str(package))
+            print(
+                f"[H5P] Selected package through contextual H5P upload input: {package.name}",
+                flush=True,
+            )
+            return True
+        except Exception as exc:
+            print(f"[H5P] Contextual upload input failed: {exc}", flush=True)
+
+    # Some builds create the input lazily only after the styled button is
+    # activated. Click the exact visible control and capture its file chooser.
+    button_selectors = [
+        'button:has-text("Upload a file")',
+        '[role="button"]:has-text("Upload a file")',
+        'label:has-text("Upload a file")',
+        'a:has-text("Upload a file")',
+        'text="Upload a file"',
+    ]
 
     for scope in _scopes(page):
-        for name in button_names:
-            candidates = []
+        for selector in button_selectors:
             try:
-                candidates.append(scope.get_by_role("button", name=name, exact=False).first)
+                locs = scope.locator(selector)
+                count = await locs.count()
             except Exception:
-                pass
-            try:
-                candidates.append(scope.get_by_text(name, exact=True).first)
-            except Exception:
-                pass
+                continue
 
-            for loc in candidates:
+            for i in range(count):
+                loc = locs.nth(i)
                 try:
-                    await loc.wait_for(state="visible", timeout=1800)
+                    if not await loc.is_visible():
+                        continue
                 except Exception:
                     continue
+
                 try:
-                    async with page.expect_file_chooser(timeout=6000) as chooser_info:
-                        await loc.click(force=True)
+                    async with page.expect_file_chooser(timeout=4500) as chooser_info:
+                        await loc.click(timeout=3500)
                     chooser = await chooser_info.value
                     await chooser.set_files(str(package))
-                    print(f"[H5P] Selected package through file chooser: {package.name}", flush=True)
+                    print(
+                        f"[H5P] Selected package through visible Upload a file control: {package.name}",
+                        flush=True,
+                    )
                     return True
                 except Exception:
-                    # Some H5P Hub builds wire the button to an already-existing
-                    # hidden input instead of emitting a filechooser event.
-                    continue
+                    # If clicking created the hidden input without a chooser
+                    # event, locate the *contextual* input again and set it.
+                    contextual_input = await _find_upload_input(page, timeout_ms=2500)
+                    if contextual_input is not None:
+                        try:
+                            await contextual_input.set_input_files(str(package))
+                            print(
+                                f"[H5P] Selected package after activating Upload a file: {package.name}",
+                                flush=True,
+                            )
+                            return True
+                        except Exception:
+                            pass
+
     return False
 
 
@@ -628,17 +724,6 @@ async def _upload_package(page, package: Path) -> None:
     selected = await _click_upload_file_and_choose(page, package)
 
     if not selected:
-        # Fallback for H5P builds exposing a stable hidden input.
-        file_input = await _find_upload_input(page, timeout_ms=12000)
-        if file_input:
-            try:
-                await file_input.set_input_files(str(package))
-                selected = True
-                print(f"[H5P] Selected package through hidden input: {package.name}", flush=True)
-            except Exception:
-                selected = False
-
-    if not selected:
         frame_info = []
         for frame in page.frames:
             try:
@@ -648,7 +733,7 @@ async def _upload_package(page, package: Path) -> None:
             frame_info.append(f"{frame.url or '<no-url>'} (file_inputs={count})")
         details = "; ".join(frame_info[:8]) or "no frames detected"
         raise H5PAutomationError(
-            "Could not activate the H5P.com 'Upload a file' control. "
+            "Could not identify or activate the H5P.com package upload control. "
             f"Frames checked: {details}"
         )
 
