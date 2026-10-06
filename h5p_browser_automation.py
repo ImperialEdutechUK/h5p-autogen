@@ -1,5 +1,6 @@
 import json
 import os
+import zipfile
 from pathlib import Path
 from typing import Optional
 
@@ -323,6 +324,93 @@ async def _wait_for_package_selected(page, package: Path, timeout_ms: int = 1500
     )
 
 
+
+
+def _package_title(package: Path) -> str:
+    """Read the generated H5P title so we can detect when H5P.com has really loaded it."""
+    try:
+        with zipfile.ZipFile(package, "r") as zf:
+            data = json.loads(zf.read("h5p.json").decode("utf-8"))
+        return str(data.get("title") or "").strip()
+    except Exception:
+        return ""
+
+
+async def _package_title_is_loaded(page, title: str) -> bool:
+    """Detect the imported package by its title in text or editor form values."""
+    title = " ".join((title or "").split()).strip().lower()
+    if not title:
+        return False
+
+    for scope in _scopes(page):
+        try:
+            body = " ".join((await scope.locator("body").inner_text()).split()).lower()
+            if title in body:
+                return True
+        except Exception:
+            pass
+
+        # H5P editor titles are commonly values of inputs and therefore do not
+        # necessarily appear in innerText. Check form control values explicitly.
+        for selector in ('input', 'textarea'):
+            try:
+                locs = scope.locator(selector)
+                count = min(await locs.count(), 100)
+                for i in range(count):
+                    try:
+                        value = " ".join((await locs.nth(i).input_value()).split()).lower()
+                        if value and (title in value or value in title):
+                            return True
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+    return False
+
+
+async def _next_import_action(page):
+    """Find a post-file-selection action H5P.com may require before the editor loads.
+
+    H5P.com deployments differ: some auto-import after file selection, while
+    others expose Upload, Import, Use or Continue. We support all of them.
+    """
+    names = ["Upload", "Import", "Use", "Continue"]
+    for scope in _scopes(page):
+        for name in names:
+            try:
+                loc = scope.get_by_role("button", name=name, exact=True).first
+                if await loc.count() and await loc.is_visible() and await loc.is_enabled():
+                    return loc, name
+            except Exception:
+                pass
+            for selector in (
+                f'button:has-text("{name}")',
+                f'input[type="submit"][value="{name}" i]',
+                f'input[type="button"][value="{name}" i]',
+                f'[role="button"]:has-text("{name}")',
+            ):
+                try:
+                    locs = scope.locator(selector)
+                    for i in range(await locs.count()):
+                        loc = locs.nth(i)
+                        if not await loc.is_visible() or not await loc.is_enabled():
+                            continue
+                        txt = ""
+                        val = ""
+                        try:
+                            txt = (await loc.inner_text()).strip().lower()
+                        except Exception:
+                            pass
+                        try:
+                            val = (await loc.get_attribute("value") or "").strip().lower()
+                        except Exception:
+                            pass
+                        if txt == name.lower() or val == name.lower():
+                            return loc, name
+                except Exception:
+                    pass
+    return None, ""
+
 async def _visible_text(scope) -> str:
     try:
         return (await scope.locator("body").inner_text()).lower()
@@ -468,10 +556,16 @@ async def _editor_is_ready(page) -> bool:
     return False
 
 
-async def _wait_for_use_then_editor(page, timeout_ms: int = 120000) -> None:
-    """Wait for H5P Hub to upload the package, click Use, then wait for editor."""
+async def _wait_for_use_then_editor(page, package: Path, timeout_ms: int = 180000) -> None:
+    """Wait for H5P.com to turn the selected package into an editable activity.
+
+    The Imperial Learning tenant can import automatically after file selection;
+    other H5P.com builds show Upload/Import/Use/Continue. Do not assume a Use
+    button must appear.
+    """
     steps = max(1, timeout_ms // 500)
-    use_clicked = False
+    title = _package_title(package)
+    clicked_actions = set()
 
     for _ in range(steps):
         err = await _hub_upload_error(page)
@@ -482,37 +576,48 @@ async def _wait_for_use_then_editor(page, timeout_ms: int = 120000) -> None:
             print("[H5P] Imported package is loaded in the editor.", flush=True)
             return
 
-        use = await _visible_use_control(page)
-        if use and not use_clicked:
-            print("[H5P] Upload completed. Clicking Use to import package into editor...", flush=True)
-            try:
-                await use.click(force=True)
-                use_clicked = True
-            except Exception as exc:
-                raise H5PAutomationError(
-                    f"H5P.com showed the Use button, but automation could not click it: {exc}"
-                ) from exc
-            await page.wait_for_timeout(800)
-            continue
+        if title and await _package_title_is_loaded(page, title):
+            print(f"[H5P] Imported package title detected in editor: {title}", flush=True)
+            return
+
+        action, label = await _next_import_action(page)
+        if action is not None:
+            # Clicking the same action repeatedly can restart an upload. Click
+            # each stage once, then wait for H5P.com to advance.
+            key = label.lower()
+            if key not in clicked_actions:
+                print(f"[H5P] Clicking {label} to advance package import...", flush=True)
+                try:
+                    await action.click(force=True)
+                    clicked_actions.add(key)
+                    await page.wait_for_timeout(1200)
+                    continue
+                except Exception as exc:
+                    raise H5PAutomationError(
+                        f"H5P.com showed a {label} action, but automation could not click it: {exc}"
+                    ) from exc
 
         await page.wait_for_timeout(500)
 
-    # Collect useful diagnostics instead of allowing Save to be clicked early.
     excerpt = ""
     try:
-        excerpt = " ".join((await page.locator("body").inner_text()).split())[:1200]
+        excerpt = " ".join((await page.locator("body").inner_text()).split())[:1500]
     except Exception:
         pass
-    use_present = bool(await _visible_use_control(page))
+    buttons = []
+    try:
+        buttons = [x.strip() for x in await page.locator("button").all_inner_texts() if x.strip()][:30]
+    except Exception:
+        pass
     raise H5PAutomationError(
-        "The .h5p file was selected, but H5P.com did not load it into the editor. "
-        f"Use button still visible: {use_present}. Page excerpt: {excerpt}"
+        "The .h5p file was selected, but H5P.com did not expose the imported activity editor. "
+        f"Expected title: {title or '<unknown>'}. Visible buttons: {buttons}. Page excerpt: {excerpt}"
     )
 
 
-async def _wait_for_import_to_finish(page, timeout_ms: int = 120000) -> None:
-    """Compatibility wrapper for the strict Upload -> Use -> editor sequence."""
-    await _wait_for_use_then_editor(page, timeout_ms=timeout_ms)
+async def _wait_for_import_to_finish(page, package: Path, timeout_ms: int = 180000) -> None:
+    """Compatibility wrapper for the H5P.com import sequence."""
+    await _wait_for_use_then_editor(page, package, timeout_ms=timeout_ms)
 
 
 async def _upload_package(page, package: Path) -> None:
@@ -550,10 +655,10 @@ async def _upload_package(page, package: Path) -> None:
     await _wait_for_package_selected(page, package, timeout_ms=15000)
     print("[H5P] Generated .h5p file selected successfully.", flush=True)
 
-    # H5P does NOT insert a selected package directly into the editor. After the
-    # upload finishes the Hub presents a separate "Use" action. Only after Use
-    # has been clicked is the outer H5P.com Save button valid.
-    await _wait_for_use_then_editor(page, timeout_ms=120000)
+    # H5P.com may auto-import immediately after selection or may expose an
+    # Upload/Import/Use/Continue step. Wait for the real editor, not for any
+    # single tenant-specific button.
+    await _wait_for_use_then_editor(page, package, timeout_ms=180000)
 
 
 async def _find_save_control(page, timeout_ms: int = 30000):
@@ -600,12 +705,12 @@ async def _find_save_control(page, timeout_ms: int = 30000):
     return None
 
 
-async def _save_content(page) -> str:
+async def _save_content(page, package: Path) -> str:
     # Import must already be complete before Save is clicked. The Save button is
     # visible even on an empty H5P create form, so clicking too early only triggers
     # 'Select content type or upload content.' validation.
     if not await _editor_is_ready(page):
-        await _wait_for_import_to_finish(page, timeout_ms=120000)
+        await _wait_for_import_to_finish(page, package, timeout_ms=180000)
 
     save = await _find_save_control(page, timeout_ms=30000)
     if not save:
@@ -746,7 +851,7 @@ async def automate_h5p_com_import(
 
             final_url = page.url
             if auto_save:
-                final_url = await _save_content(page)
+                final_url = await _save_content(page, package)
 
             return {
                 "ok": True,
