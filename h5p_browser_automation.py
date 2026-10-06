@@ -323,70 +323,196 @@ async def _wait_for_package_selected(page, package: Path, timeout_ms: int = 1500
     )
 
 
-async def _editor_is_ready(page) -> bool:
-    """Detect when H5P has finished importing and the content editor is usable."""
+async def _visible_text(scope) -> str:
+    try:
+        return (await scope.locator("body").inner_text()).lower()
+    except Exception:
+        return ""
+
+
+async def _visible_use_control(page):
+    """Return H5P Hub's visible Use button after a package upload completes."""
+    selectors = [
+        'button:has-text("Use")',
+        'a:has-text("Use")',
+        'input[type="button"][value="Use" i]',
+        'input[type="submit"][value="Use" i]',
+        '[role="button"]:has-text("Use")',
+        '.h5p-hub-button:has-text("Use")',
+    ]
     for scope in _scopes(page):
         try:
-            body = (await scope.locator("body").inner_text()).lower()
+            loc = scope.get_by_role("button", name="Use", exact=True).first
+            if await loc.count() and await loc.is_visible() and await loc.is_enabled():
+                return loc
         except Exception:
+            pass
+        for selector in selectors:
+            try:
+                locs = scope.locator(selector)
+                for i in range(await locs.count()):
+                    loc = locs.nth(i)
+                    if await loc.is_visible() and await loc.is_enabled():
+                        # Avoid matching unrelated text that merely contains "Use".
+                        try:
+                            txt = (await loc.inner_text()).strip().lower()
+                            val = (await loc.get_attribute("value") or "").strip().lower()
+                            if txt == "use" or val == "use":
+                                return loc
+                        except Exception:
+                            return loc
+            except Exception:
+                pass
+    return None
+
+
+async def _hub_upload_error(page) -> str:
+    """Return a visible H5P Hub upload/validation error, if one is present."""
+    needles = [
+        "could not be uploaded",
+        "selected file could not be uploaded",
+        "unable to interpret response",
+        "invalid h5p",
+        "invalid package",
+        "validation failed",
+        "only files with the .h5p extension",
+        "file is too large",
+        "upload failed",
+        "error uploading",
+    ]
+    for scope in _scopes(page):
+        text = await _visible_text(scope)
+        if not text:
+            continue
+        for needle in needles:
+            if needle in text:
+                # Return a compact excerpt around the error phrase.
+                pos = text.find(needle)
+                a = max(0, pos - 180)
+                b = min(len(text), pos + 500)
+                return " ".join(text[a:b].split())
+    return ""
+
+
+async def _editor_is_ready(page) -> bool:
+    """Strictly detect that H5P Hub has loaded the uploaded package into the editor.
+
+    Important: selecting a file is not enough. H5P's normal reuse flow is
+    Upload -> choose .h5p -> Use -> editor. The outer H5P.com Save button is
+    visible even before that sequence completes, so we must not use it as an
+    editor-ready signal.
+    """
+    # If H5P Hub still exposes a Use button, the package has uploaded but has not
+    # yet been inserted into the editor.
+    if await _visible_use_control(page):
+        return False
+
+    editor_selectors = [
+        '.h5peditor-form',
+        '.h5peditor-field',
+        '.h5peditor-label',
+        '.h5peditor-text',
+        '.h5peditor-textarea',
+        '.h5peditor-metadata',
+        '[class*="h5peditor-form"]',
+        '[class*="h5peditor-field"]',
+    ]
+
+    for scope in _scopes(page):
+        body = await _visible_text(scope)
+        if not body:
             continue
 
-        # The validation message shown in the user's screenshot means import has
-        # NOT completed yet.
-        if "select content type or upload content" in body:
+        # These are definitive signs that H5P Hub is still in upload/selection
+        # mode rather than showing the imported editor.
+        still_uploading = [
+            "upload an h5p file",
+            "select content type or upload content",
+            "now uploading",
+        ]
+        if any(marker in body for marker in still_uploading):
             continue
 
-        # Common editor labels that appear after a content type/package loads.
-        ready_markers = [
+        # Prefer real H5P editor DOM markers over text heuristics.
+        for selector in editor_selectors:
+            try:
+                locs = scope.locator(selector)
+                for i in range(min(await locs.count(), 8)):
+                    if await locs.nth(i).is_visible():
+                        return True
+            except Exception:
+                pass
+
+        # Fallback: require multiple editor-specific labels, not merely the
+        # changed content-type heading. This avoids the previous false positive
+        # where Save was clicked while H5P Hub was still waiting for "Use".
+        editor_labels = [
             "metadata",
             "task description",
             "behavioural settings",
             "behavioral settings",
             "overall feedback",
             "tutorial",
-            "title *",
-            "title*",
         ]
-        if any(marker in body for marker in ready_markers):
+        label_hits = sum(1 for marker in editor_labels if marker in body)
+        if label_hits >= 2:
             return True
 
-        # The H5P Hub header starts as 'Select content type'. Once a package is
-        # imported it normally changes to the actual activity type.
-        if "create or upload content" in body and "select content type" not in body:
+        # A visible required Title field together with a non-Hub editor label is
+        # also a strong signal for simpler content types.
+        if ("title *" in body or "title*" in body) and any(
+            marker in body for marker in ["media", "text", "question", "description"]
+        ):
             return True
 
     return False
 
 
-async def _wait_for_import_to_finish(page, timeout_ms: int = 120000) -> None:
-    """Wait until the uploaded package has been parsed into the H5P editor."""
+async def _wait_for_use_then_editor(page, timeout_ms: int = 120000) -> None:
+    """Wait for H5P Hub to upload the package, click Use, then wait for editor."""
     steps = max(1, timeout_ms // 500)
-    for step in range(steps):
+    use_clicked = False
+
+    for _ in range(steps):
+        err = await _hub_upload_error(page)
+        if err:
+            raise H5PAutomationError(f"H5P.com rejected the uploaded .h5p package: {err}")
+
         if await _editor_is_ready(page):
             print("[H5P] Imported package is loaded in the editor.", flush=True)
             return
 
-        # Some H5P Hub versions show a second explicit Import/Use/Continue action
-        # after the file is chosen. Do not click generic 'Upload' here because on
-        # the Imperial UI that is the radio tab, not an import confirmation.
-        if step % 4 == 0:
-            await _click_role_or_text(
-                page,
-                ["Import", "Use", "Continue", "Insert"],
-                timeout_ms=900,
-            )
+        use = await _visible_use_control(page)
+        if use and not use_clicked:
+            print("[H5P] Upload completed. Clicking Use to import package into editor...", flush=True)
+            try:
+                await use.click(force=True)
+                use_clicked = True
+            except Exception as exc:
+                raise H5PAutomationError(
+                    f"H5P.com showed the Use button, but automation could not click it: {exc}"
+                ) from exc
+            await page.wait_for_timeout(800)
+            continue
+
         await page.wait_for_timeout(500)
 
-    # Include a short body excerpt to make future selector issues diagnosable.
+    # Collect useful diagnostics instead of allowing Save to be clicked early.
     excerpt = ""
     try:
-        excerpt = (await page.locator("body").inner_text()).replace("\n", " ")[:900]
+        excerpt = " ".join((await page.locator("body").inner_text()).split())[:1200]
     except Exception:
         pass
+    use_present = bool(await _visible_use_control(page))
     raise H5PAutomationError(
-        "The .h5p file was selected, but H5P.com did not finish importing it into the editor "
-        f"within 120 seconds. Page excerpt: {excerpt}"
+        "The .h5p file was selected, but H5P.com did not load it into the editor. "
+        f"Use button still visible: {use_present}. Page excerpt: {excerpt}"
     )
+
+
+async def _wait_for_import_to_finish(page, timeout_ms: int = 120000) -> None:
+    """Compatibility wrapper for the strict Upload -> Use -> editor sequence."""
+    await _wait_for_use_then_editor(page, timeout_ms=timeout_ms)
 
 
 async def _upload_package(page, package: Path) -> None:
@@ -423,7 +549,11 @@ async def _upload_package(page, package: Path) -> None:
 
     await _wait_for_package_selected(page, package, timeout_ms=15000)
     print("[H5P] Generated .h5p file selected successfully.", flush=True)
-    await _wait_for_import_to_finish(page, timeout_ms=120000)
+
+    # H5P does NOT insert a selected package directly into the editor. After the
+    # upload finishes the Hub presents a separate "Use" action. Only after Use
+    # has been clicked is the outer H5P.com Save button valid.
+    await _wait_for_use_then_editor(page, timeout_ms=120000)
 
 
 async def _find_save_control(page, timeout_ms: int = 30000):
