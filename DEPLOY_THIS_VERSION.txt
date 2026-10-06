@@ -1,0 +1,30 @@
+H5P publish fix build
+Version: 2026-10-06-visible-upload-use-v4
+
+Why this build exists
+---------------------
+The Railway log line:
+  [H5P] Selected package through hidden input: ...
+comes from an older automation build. That text does not exist in this fixed source.
+
+After deploying THIS folder, Railway must show:
+  [H5P] Automation version: 2026-10-06-visible-upload-use-v4
+
+The /health endpoint must also include:
+  "h5p_automation_version": "2026-10-06-visible-upload-use-v4"
+
+Expected publish flow in Railway logs
+-------------------------------------
+1. [H5P] Publish job ... started with 2026-10-06-visible-upload-use-v4.
+2. [H5P] Upload mode selected. Choosing generated package...
+3. [H5P] Selected package through visible Upload a file control: ...
+   OR a contextual-input fallback message.
+4. [H5P] Generated .h5p file selected successfully.
+5. [H5P] Package upload completed. Clicking Use...
+6. [H5P] Imported package is loaded in the editor.
+7. [H5P] Clicking Save...
+8. [H5P] Saved activity: ...
+9. [H5P] Publish job ... completed: ...
+
+If H5P.com shows that the subscription is past due, this build now fails quickly
+with an explicit error instead of waiting silently.

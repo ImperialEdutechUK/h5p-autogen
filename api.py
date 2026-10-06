@@ -13,7 +13,7 @@ from fastapi.responses import FileResponse
 from pydantic import BaseModel
 
 import generator_core as core
-from h5p_browser_automation import automate_h5p_com_import, check_h5p_com_connection
+from h5p_browser_automation import AUTOMATION_VERSION, automate_h5p_com_import, check_h5p_com_connection
 
 BASE_DIR = Path(__file__).resolve().parent
 TEMPLATES_DIR = BASE_DIR / "templates"
@@ -114,6 +114,7 @@ def health():
         "service": "h5p-autogen-api",
         "llm_configured": bool(os.getenv("LLM_API_KEY")),
         "templates": len(_templates()),
+        "h5p_automation_version": AUTOMATION_VERSION,
     }
 
 
@@ -507,8 +508,10 @@ async def _run_h5p_publish_job(
         {
             "status": "running",
             "message": "Uploading generated package to H5P.com...",
+            "automation_version": AUTOMATION_VERSION,
         },
     )
+    print(f"[H5P] Publish job {publish_job_id} started with {AUTOMATION_VERSION}.", flush=True)
     try:
         result = await automate_h5p_com_import(
             h5p_path,
@@ -527,15 +530,19 @@ async def _run_h5p_publish_job(
                 "message": "Published to H5P successfully.",
                 "url": final_url,
                 "result": result,
+                "automation_version": AUTOMATION_VERSION,
             },
         )
+        print(f"[H5P] Publish job {publish_job_id} completed: {final_url}", flush=True)
     except Exception as exc:
+        print(f"[H5P] Publish job {publish_job_id} FAILED: {exc}", flush=True)
         _write_publish_status(
             publish_job_id,
             {
                 "status": "failed",
                 "message": "H5P publish failed.",
                 "error": str(exc),
+                "automation_version": AUTOMATION_VERSION,
             },
         )
 
@@ -573,6 +580,7 @@ async def publish_to_h5p(
             "status": "queued",
             "message": "H5P publish job queued.",
             "source_job_id": job_id,
+            "automation_version": AUTOMATION_VERSION,
         },
     )
     background_tasks.add_task(

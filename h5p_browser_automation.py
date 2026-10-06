@@ -7,6 +7,9 @@ from typing import Optional
 from playwright.async_api import async_playwright, TimeoutError as PlaywrightTimeoutError
 
 
+AUTOMATION_VERSION = "2026-10-06-visible-upload-use-v4"
+
+
 class H5PAutomationError(RuntimeError):
     pass
 
@@ -303,28 +306,13 @@ async def _find_upload_input(page, timeout_ms: int = 15000):
 
 
 async def _click_upload_file_and_choose(page, package: Path) -> bool:
-    """Choose the package through the actual visible H5P Hub upload control.
+    """Choose the package through H5P Hub's real Upload a file control.
 
-    First target the hidden input that is contextually linked to the visible
-    "Upload an H5P file" panel. This is more reliable in headless Chromium than
-    choosing an arbitrary hidden file input. If the input is created only after
-    clicking the styled button, fall back to the browser file chooser.
+    H5P Hub normally starts parsing/uploading only after the visible Upload a
+    file control fires its file-chooser/change flow. Prefer that path. A hidden
+    contextual input is retained only as a fallback for tenant variants that do
+    not emit a file-chooser event in headless Chromium.
     """
-    # Fast path: use the file input belonging to the visible H5P package panel.
-    contextual_input = await _find_upload_input(page, timeout_ms=6000)
-    if contextual_input is not None:
-        try:
-            await contextual_input.set_input_files(str(package))
-            print(
-                f"[H5P] Selected package through contextual H5P upload input: {package.name}",
-                flush=True,
-            )
-            return True
-        except Exception as exc:
-            print(f"[H5P] Contextual upload input failed: {exc}", flush=True)
-
-    # Some builds create the input lazily only after the styled button is
-    # activated. Click the exact visible control and capture its file chooser.
     button_selectors = [
         'button:has-text("Upload a file")',
         '[role="button"]:has-text("Upload a file")',
@@ -333,6 +321,7 @@ async def _click_upload_file_and_choose(page, package: Path) -> bool:
         'text="Upload a file"',
     ]
 
+    # Preferred path: activate the same visible control a user clicks.
     for scope in _scopes(page):
         for selector in button_selectors:
             try:
@@ -350,8 +339,8 @@ async def _click_upload_file_and_choose(page, package: Path) -> bool:
                     continue
 
                 try:
-                    async with page.expect_file_chooser(timeout=4500) as chooser_info:
-                        await loc.click(timeout=3500)
+                    async with page.expect_file_chooser(timeout=5000) as chooser_info:
+                        await loc.click(timeout=4000, force=True)
                     chooser = await chooser_info.value
                     await chooser.set_files(str(package))
                     print(
@@ -360,8 +349,9 @@ async def _click_upload_file_and_choose(page, package: Path) -> bool:
                     )
                     return True
                 except Exception:
-                    # If clicking created the hidden input without a chooser
-                    # event, locate the *contextual* input again and set it.
+                    # Some Hub builds create/activate a hidden file input without
+                    # raising Playwright's filechooser event. If so, use the
+                    # contextual H5P input immediately after the visible click.
                     contextual_input = await _find_upload_input(page, timeout_ms=2500)
                     if contextual_input is not None:
                         try:
@@ -373,6 +363,20 @@ async def _click_upload_file_and_choose(page, package: Path) -> bool:
                             return True
                         except Exception:
                             pass
+
+    # Last-resort path for tenants where the styled control is inaccessible in
+    # headless mode but the correct H5P file input is present.
+    contextual_input = await _find_upload_input(page, timeout_ms=6000)
+    if contextual_input is not None:
+        try:
+            await contextual_input.set_input_files(str(package))
+            print(
+                f"[H5P] Selected package through contextual H5P upload input fallback: {package.name}",
+                flush=True,
+            )
+            return True
+        except Exception as exc:
+            print(f"[H5P] Contextual upload input fallback failed: {exc}", flush=True)
 
     return False
 
@@ -470,7 +474,10 @@ async def _next_import_action(page):
     H5P.com deployments differ: some auto-import after file selection, while
     others expose Upload, Import, Use or Continue. We support all of them.
     """
-    names = ["Upload", "Import", "Use", "Continue"]
+    # After a file has been chosen, H5P Hub uploads it automatically and then
+    # exposes Use. Do not click the Upload tab again here: doing so can reset or
+    # interrupt the selected package on some H5P.com tenants.
+    names = ["Use", "Import", "Continue"]
     for scope in _scopes(page):
         for name in names:
             try:
@@ -563,6 +570,10 @@ async def _hub_upload_error(page) -> str:
         "file is too large",
         "upload failed",
         "error uploading",
+        "subscription is past due",
+        "your subscription is past due",
+        "pay for your subscription",
+        "subscription has expired",
     ]
     for scope in _scopes(page):
         text = await _visible_text(scope)
@@ -653,20 +664,36 @@ async def _editor_is_ready(page) -> bool:
 
 
 async def _wait_for_use_then_editor(page, package: Path, timeout_ms: int = 180000) -> None:
-    """Wait for H5P.com to turn the selected package into an editable activity.
+    """Wait for H5P.com to import the selected package and open its editor.
 
-    The Imperial Learning tenant can import automatically after file selection;
-    other H5P.com builds show Upload/Import/Use/Continue. Do not assume a Use
-    button must appear.
+    Standard H5P Hub flow is Upload -> choose .h5p -> automatic upload -> Use
+    -> editor. Some tenants skip the Use step. This loop handles both flows and
+    emits progress messages so Railway does not appear to stall silently.
     """
     steps = max(1, timeout_ms // 500)
     title = _package_title(package)
     clicked_actions = set()
+    success_logged = False
 
-    for _ in range(steps):
+    for step in range(steps):
         err = await _hub_upload_error(page)
         if err:
             raise H5PAutomationError(f"H5P.com rejected the uploaded .h5p package: {err}")
+
+        # H5P Hub's normal reuse flow shows Use only after the upload has
+        # completed successfully. Click it as soon as it appears.
+        use = await _visible_use_control(page)
+        if use is not None and "use" not in clicked_actions:
+            print("[H5P] Package upload completed. Clicking Use...", flush=True)
+            try:
+                await use.click(force=True)
+                clicked_actions.add("use")
+                await page.wait_for_timeout(1200)
+                continue
+            except Exception as exc:
+                raise H5PAutomationError(
+                    f"H5P.com showed Use after upload, but automation could not click it: {exc}"
+                ) from exc
 
         if await _editor_is_ready(page):
             print("[H5P] Imported package is loaded in the editor.", flush=True)
@@ -676,10 +703,19 @@ async def _wait_for_use_then_editor(page, package: Path, timeout_ms: int = 18000
             print(f"[H5P] Imported package title detected in editor: {title}", flush=True)
             return
 
+        # Log successful upload text when present, even if Use has not appeared
+        # yet. This distinguishes server-side H5P parsing from file-selection
+        # problems in Railway logs.
+        if not success_logged:
+            for scope in _scopes(page):
+                body = await _visible_text(scope)
+                if "successfully uploaded" in body:
+                    print("[H5P] H5P Hub reports that the package was successfully uploaded.", flush=True)
+                    success_logged = True
+                    break
+
         action, label = await _next_import_action(page)
         if action is not None:
-            # Clicking the same action repeatedly can restart an upload. Click
-            # each stage once, then wait for H5P.com to advance.
             key = label.lower()
             if key not in clicked_actions:
                 print(f"[H5P] Clicking {label} to advance package import...", flush=True)
@@ -692,6 +728,10 @@ async def _wait_for_use_then_editor(page, package: Path, timeout_ms: int = 18000
                     raise H5PAutomationError(
                         f"H5P.com showed a {label} action, but automation could not click it: {exc}"
                     ) from exc
+
+        if step and step % 20 == 0:
+            elapsed = (step * 500) // 1000
+            print(f"[H5P] Still waiting for H5P Hub import/editor ({elapsed}s)...", flush=True)
 
         await page.wait_for_timeout(500)
 
@@ -895,6 +935,7 @@ async def automate_h5p_com_import(
     Flow: authenticate -> /content/create -> Upload -> choose .h5p -> Save -> return URL.
     """
     package = Path(h5p_path)
+    print(f"[H5P] Automation version: {AUTOMATION_VERSION}", flush=True)
     if not package.exists():
         raise H5PAutomationError(f"H5P package not found: {package}")
 
