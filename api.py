@@ -1,3 +1,4 @@
+import asyncio
 import json
 import os
 import shutil
@@ -22,6 +23,8 @@ ARTIFACT_DIR.mkdir(parents=True, exist_ok=True)
 ARTIFACT_TTL_SECONDS = int(os.getenv("ARTIFACT_TTL_SECONDS", "7200"))
 PUBLISH_DIR = ARTIFACT_DIR / "_publish_jobs"
 PUBLISH_DIR.mkdir(parents=True, exist_ok=True)
+H5P_PUBLISH_TIMEOUT_SECONDS = int(os.getenv("H5P_PUBLISH_TIMEOUT_SECONDS", "300"))
+RUNNING_PUBLISH_TASKS: set[asyncio.Task] = set()
 
 app = FastAPI(title="H5P Activity Generator API", version="2.0.0")
 origins_raw = os.getenv("FRONTEND_ORIGINS", "*").strip()
@@ -513,10 +516,13 @@ async def _run_h5p_publish_job(
     )
     print(f"[H5P] Publish job {publish_job_id} started with {AUTOMATION_VERSION}.", flush=True)
     try:
-        result = await automate_h5p_com_import(
-            h5p_path,
-            auto_save=auto_save,
-            inspect_test_target=inspect_test_target,
+        result = await asyncio.wait_for(
+            automate_h5p_com_import(
+                h5p_path,
+                auto_save=auto_save,
+                inspect_test_target=inspect_test_target,
+            ),
+            timeout=H5P_PUBLISH_TIMEOUT_SECONDS,
         )
         final_url = (
             result.get("url")
@@ -534,6 +540,33 @@ async def _run_h5p_publish_job(
             },
         )
         print(f"[H5P] Publish job {publish_job_id} completed: {final_url}", flush=True)
+    except asyncio.TimeoutError:
+        error = (
+            f"H5P browser automation exceeded {H5P_PUBLISH_TIMEOUT_SECONDS} seconds. "
+            "The browser did not complete the H5P import/save flow."
+        )
+        print(f"[H5P] Publish job {publish_job_id} FAILED: {error}", flush=True)
+        _write_publish_status(
+            publish_job_id,
+            {
+                "status": "failed",
+                "message": "H5P publish timed out in the backend.",
+                "error": error,
+                "automation_version": AUTOMATION_VERSION,
+            },
+        )
+    except asyncio.CancelledError:
+        error = "H5P publish task was cancelled by the backend process before it completed."
+        print(f"[H5P] Publish job {publish_job_id} CANCELLED.", flush=True)
+        _write_publish_status(
+            publish_job_id,
+            {
+                "status": "failed",
+                "message": "H5P publish task was cancelled.",
+                "error": error,
+                "automation_version": AUTOMATION_VERSION,
+            },
+        )
     except Exception as exc:
         print(f"[H5P] Publish job {publish_job_id} FAILED: {exc}", flush=True)
         _write_publish_status(
@@ -564,10 +597,15 @@ async def h5p_automation_check():
 @app.post("/api/jobs/{job_id}/publish-to-h5p", status_code=202)
 async def publish_to_h5p(
     job_id: str,
-    background_tasks: BackgroundTasks,
     body: H5PBrowserRequest = H5PBrowserRequest(),
 ):
-    """Start H5P.com publishing in the background and return immediately."""
+    """Start H5P.com publishing as a detached asyncio task and return immediately.
+
+    Starlette BackgroundTasks run as part of the response lifecycle. A long browser
+    automation job can therefore be cancelled by a proxy/request lifecycle even after
+    the client has received the 202 response. Keeping a strong reference to a detached
+    asyncio task avoids that failure mode while this web process remains alive.
+    """
     job_dir = ARTIFACT_DIR / job_id
     files = list(job_dir.glob("*.h5p")) if job_dir.exists() else []
     if not files:
@@ -583,17 +621,25 @@ async def publish_to_h5p(
             "automation_version": AUTOMATION_VERSION,
         },
     )
-    background_tasks.add_task(
-        _run_h5p_publish_job,
-        publish_job_id,
-        str(files[0]),
-        body.auto_save,
-        body.inspect_test_target,
+
+    task = asyncio.create_task(
+        _run_h5p_publish_job(
+            publish_job_id,
+            str(files[0]),
+            body.auto_save,
+            body.inspect_test_target,
+        ),
+        name=f"h5p-publish-{publish_job_id}",
     )
+    RUNNING_PUBLISH_TASKS.add(task)
+    task.add_done_callback(RUNNING_PUBLISH_TASKS.discard)
+
     return {
         "publish_job_id": publish_job_id,
         "status": "queued",
         "status_url": f"/api/h5p/publish-jobs/{publish_job_id}",
+        "automation_version": AUTOMATION_VERSION,
+        "backend_timeout_seconds": H5P_PUBLISH_TIMEOUT_SECONDS,
     }
 
 

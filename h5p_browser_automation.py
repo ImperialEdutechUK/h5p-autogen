@@ -7,7 +7,7 @@ from typing import Optional
 from playwright.async_api import async_playwright, TimeoutError as PlaywrightTimeoutError
 
 
-AUTOMATION_VERSION = "2026-10-06-visible-upload-use-v4"
+AUTOMATION_VERSION = "2026-10-06-detached-publish-v5"
 
 
 class H5PAutomationError(RuntimeError):

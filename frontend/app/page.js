@@ -169,11 +169,16 @@ export default function Home() {
       const publishJobId = startData.publish_job_id;
       if (!publishJobId) throw new Error("Backend did not return an H5P publish job ID.");
 
-      setMessage("Publishing to H5P... You can keep using this page while it finishes.");
+      const backendVersion = startData.automation_version || "unknown";
+      const backendTimeout = Number(startData.backend_timeout_seconds || 300);
+      setMessage(`Publishing to H5P... Backend ${backendVersion}.`);
 
       // Poll instead of keeping one HTTP request open for several minutes.
-      const deadline = Date.now() + 10 * 60 * 1000;
+      // The backend now has its own hard timeout, so the browser waits a little
+      // longer than that and should receive a concrete completed/failed state.
+      const deadline = Date.now() + Math.max(backendTimeout + 90, 390) * 1000;
       let consecutiveNetworkErrors = 0;
+      let lastStatusData = null;
 
       while (Date.now() < deadline) {
         await sleep(2500);
@@ -190,6 +195,7 @@ export default function Home() {
           }
 
           consecutiveNetworkErrors = 0;
+          lastStatusData = statusData;
           const status = statusData.status;
 
           if (status === "completed") {
@@ -226,7 +232,9 @@ export default function Home() {
         }
       }
 
-      throw new Error("H5P publishing is taking longer than 10 minutes. Check Railway logs for the publish job.");
+      const lastMessage = lastStatusData?.error || lastStatusData?.message || "No backend status message was returned.";
+      const lastVersion = lastStatusData?.automation_version || backendVersion;
+      throw new Error(`H5P publishing did not finish before the browser deadline. Backend ${lastVersion}. Last status: ${lastMessage}`);
     } catch (e) {
       if (h5pWindow && !h5pWindow.closed) {
         h5pWindow.document.body.innerHTML =
